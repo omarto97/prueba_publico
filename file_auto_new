@@ -1,0 +1,1483 @@
+"""
+=============================================================
+  ANALIZADOR MASIVO DE ARCHIVOS - v4  (VERSIÓN FINAL)
+  Abbott Laboratories | Evaluación de Automatizabilidad
+
+  Soporta : XLS, XLSX, XLSM, XLSB, CSV, TXT, MSG (Outlook)
+  Recorre : subcarpetas recursivamente
+
+  INSTALACIÓN (una sola vez):
+      pip install "xlrd==1.2.0" pyxlsb openpyxl pandas chardet extract-msg msoffcrypto-tool
+
+  USO:
+      1. Ajusta CARPETA_RAIZ (línea ~80)
+      2. Ajusta GRUPOS_CARPETAS si conoces la estructura (opcional)
+      3. python analizar_archivos_v4.py
+
+  SALIDA: reporte_inventario.xlsx con 7 hojas:
+      • DASHBOARD         resumen ejecutivo con KPIs y rankings
+      • SCORING           score interactivo (overrides del analista)
+      • RESUMEN           métricas por hoja/tabla
+      • DETALLE_NULOS     % nulos por columna
+      • ADJUNTOS_CORREOS  adjuntos encontrados en .msg
+      • GRUPOS            agrupación inferida
+      • REFERENCIA        tabla completa de reglas y niveles
+      • ERRORES           archivos que no pudieron leerse
+=============================================================
+"""
+
+import os, re, io, sys, warnings, datetime, chardet
+import pandas as pd
+import openpyxl
+from openpyxl.styles import (PatternFill, Font, Alignment, Border, Side)
+from openpyxl.utils import get_column_letter
+from openpyxl.formatting.rule import ColorScaleRule
+from collections import defaultdict
+
+warnings.filterwarnings("ignore")
+
+
+# ══════════════════════════════════════════════════════════════════
+#  CONFIGURACIÓN  ← EDITA AQUÍ
+# ══════════════════════════════════════════════════════════════════
+
+CARPETA_RAIZ   = "./archivos"
+ARCHIVO_SALIDA = "reporte_inventario.xlsx"
+
+# Grupos explícitos: subcarpeta (relativa) → nombre de grupo
+# Ejemplo: {"clientes/farmacol": "FARMACOL", "ims/colombia": "IMS_CO"}
+GRUPOS_CARPETAS = {}
+
+# ── Keywords de dominio (ajusta según tu negocio) ────────────────
+KW_CLIENTE    = ["cliente","client","sold","customer","cuenta","farmacol",
+                 "audifarma","copidrogas","drogas","distribuidor","dealer"]
+KW_VENTAS     = ["venta","sale","sell","sellout","factura","invoice",
+                 "revenue","despacho","pedido","orden","sell.out","sell_out"]
+KW_INVENTARIO = ["inventario","inventory","stock","bodega","warehouse",
+                 "existencia","saldo","onhand","on_hand"]
+KW_IMS        = ["ims","iqvia","sell.in","sellin","sell_in","compra","purchase"]
+KW_PERIODO    = ["fecha","date","period","mes","month","año","year",
+                 "semana","week","trimestre","quarter","periodo"]
+KW_UNIDAD     = ["unidad","unit","qty","cantidad","cant","uds","piezas",
+                 "cajas","box","pieces","units","cantidad_vendida"]
+KW_VALOR      = ["valor","value","monto","amount","precio","price",
+                 "venta","amt","total","importe","revenue","sales"]
+KW_PRODUCTO   = ["producto","product","item","articulo","sku","cod",
+                 "codigo","referencia","ref","d56","ndc","gtin"]
+KW_MONEDA     = [r"usd",r"cop",r"eur",r"clp",r"mxn",r"currency",
+                 r"moneda",r"\$","pesos","dolares","dólares"]
+
+RE_FECHA_NOMBRE = [
+    r"\d{4}[-_]\d{2}[-_]\d{2}",
+    r"\d{2}[-_]\d{2}[-_]\d{4}",
+    r"\d{4}[-_]\d{2}(?!\d)",
+    r"(ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)",
+    r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)",
+    r"q[1-4][-_]\d{4}", r"\d{4}q[1-4]",
+]
+
+
+# ══════════════════════════════════════════════════════════════════
+#  DEFINICIÓN DE REGLAS Y PESOS
+# ══════════════════════════════════════════════════════════════════
+
+REGLAS = {
+    "A": {"descripcion": "Fecha de la fuente",          "peso": 5,
+          "max_nivel_normal": 4, "bloqueo": False, "techo": None, "auto": True,
+          "niveles": {0:"Dentro del archivo", 1:"Nombre del archivo",
+                      2:"Metadata del correo", 3:"Metadata del archivo OS",
+                      4:"No incorporada - requiere alteración o mapeo"}},
+    "B": {"descripcion": "Cod cliente ERP Sold to",     "peso": 12,
+          "max_nivel_normal": 5, "bloqueo": False, "techo": None, "auto": "estimado",
+          "niveles": {0:"Campo con nombre y código interno del cliente",
+                      1:"A partir del nombre del documento",
+                      2:"A partir de usuarios que reportan",
+                      3:"A partir de coincidencias Regex",
+                      4:"Requiere mapeo de coincidencias",
+                      5:"Requiere alterar el archivo base"}},
+    "C": {"descripcion": "Periodo de la información",   "peso": 7,
+          "max_nivel_normal": 5, "bloqueo": False, "techo": None, "auto": True,
+          "niveles": {0:"Campo identificable estándar", 1:"Campo identificable no estándar",
+                      2:"Combinación de datos", 3:"Nombre archivo (estándar)",
+                      4:"Nombre archivo (modificado por usuario)",
+                      5:"Requiere alterar el archivo base"}},
+    "D": {"descripcion": "Frecuencia de generación",    "peso": 3,
+          "max_nivel_normal": 2, "bloqueo": False, "techo": None, "auto": "estimado",
+          "niveles": {0:"Automático con calendario", 1:"Fuente estructurada, frecuencia por usuario",
+                      2:"Requiere transformación previa"}},
+    "E": {"descripcion": "Nombres de columnas",         "peso": 10,
+          "max_nivel_normal": 3, "bloqueo": True, "techo": 50, "auto": True,
+          "niveles": {0:"Siguen la estructura requerida para consolidación",
+                      1:"Siempre los mismos nombres",
+                      2:"La mayoría de veces los mismos nombres",
+                      3:"Varían: a veces más/menos columnas o nombres distintos",
+                      10:"Sin estructura mínima continuada"}},
+    "F": {"descripcion": "Fuente del documento",        "peso": 3,
+          "max_nivel_normal": 3, "bloqueo": False, "techo": None, "auto": "estimado",
+          "niveles": {0:"Fuente centralizada (portal proveedores)",
+                      1:"Proceso estándar (ERP / plantilla)",
+                      2:"Transformación por plantillas preconstruidas",
+                      3:"Transformación particular para el propósito"}},
+    "G": {"descripcion": "Integridad del documento",    "peso": 8,
+          "max_nivel_normal": 2, "bloqueo": True, "techo": 20, "auto": True,
+          "niveles": {0:"Sin errores, con protección por contraseña",
+                      1:"Sin errores al abrir",
+                      2:"Errores pero legible automáticamente",
+                      5:"Errores; requiere persona para recuperar",
+                      10:"Archivo no recuperable"}},
+    "H": {"descripcion": "Cantidad de hojas",           "peso": 5,
+          "max_nivel_normal": 4, "bloqueo": False, "techo": None, "auto": True,
+          "niveles": {0:"Una sola hoja con la info requerida",
+                      1:"Varias hojas con la info requerida",
+                      2:"Varias hojas con info extra no requerida",
+                      3:"Info requerida fragmentada en varias hojas",
+                      4:"Hojas con nombres distintos cada vez"}},
+    "I": {"descripcion": "Cantidad de elementos",       "peso": 7,
+          "max_nivel_normal": 3, "bloqueo": True, "techo": 35, "auto": True,
+          "niveles": {0:"Tabular bajo Sheet", 1:"Tabular bajo Table",
+                      2:"Tabular bajo PivotTable", 3:"Mezcla de elementos",
+                      10:"Sin estructura tabular en ningún elemento"}},
+    "J": {"descripcion": "Limpieza del formato tabular","peso": 14,
+          "max_nivel_normal": 4, "bloqueo": True, "techo": 40, "auto": True,
+          "niveles": {0:"Desde primera celda; todos los campos completos",
+                      1:"Mayoría completos, parten de primera fila",
+                      2:"Requiere eliminar filas iniciales",
+                      3:"Requiere eliminar filas iniciales e intermedias",
+                      4:"Requiere eliminar columnas y filas",
+                      10:"Se consolida de formas no estándar"}},
+    "K": {"descripcion": "Información Normalizada",     "peso": 11,
+          "max_nivel_normal": 5, "bloqueo": True, "techo": 45, "auto": True,
+          "niveles": {0:"Cada campo = una dimensión",
+                      1:"Algunos campos incumplen normalidad",
+                      2:"Un pivoteo logra la estructura normalizada",
+                      3:"Combinación de elementos para normalizar",
+                      4:"Requiere cruces internos en el documento",
+                      5:"Mapeo unificado y exclusivo por documento",
+                      10:"Requiere IA u análisis avanzado"}},
+    "L": {"descripcion": "Referencias (producto)",      "peso": 9,
+          "max_nivel_normal": 4, "bloqueo": False, "techo": None, "auto": "estimado",
+          "niveles": {0:"Campo con referencia directa al código D56",
+                      1:"Campo con código interno Abbott",
+                      2:"Referencia del cliente usable como clave única",
+                      3:"Solo nombre del producto",
+                      4:"Código agrupado del cliente"}},
+    "M": {"descripcion": "Unidades reportadas (Qty)",   "peso": 7,
+          "max_nivel_normal": 3, "bloqueo": False, "techo": None, "auto": "estimado",
+          "niveles": {0:"Campo identificable sin conversiones",
+                      1:"En varias columnas (resultado de cálculo)",
+                      2:"Identificable pero requiere conversión de unidad",
+                      3:"Campo identificable (nivel base)"}},
+    "N": {"descripcion": "Propósito de la información", "peso": 5,
+          "max_nivel_normal": 2, "bloqueo": False, "techo": None, "auto": True,
+          "niveles": {0:"Claro: ventas o inventario",
+                      1:"Identificable por nombres de columnas",
+                      2:"Solo por nombre archivo / hojas / correo"}},
+    "O": {"descripcion": "Valor de ventas (Monetario)",  "peso": 7,
+          "max_nivel_normal": 3, "bloqueo": False, "techo": None, "auto": "estimado",
+          "niveles": {0:"Columna identificable, moneda clara",
+                      1:"Varias columnas, moneda identificable",
+                      2:"Moneda no identificable, debe inferirse",
+                      3:"Columna variable y moneda no inferible"}},
+}
+
+PESO_TOTAL_RAW = sum(r["peso"] for r in REGLAS.values())  # 113, se normaliza a 100
+
+
+# ══════════════════════════════════════════════════════════════════
+#  UTILIDADES
+# ══════════════════════════════════════════════════════════════════
+
+def tiene_kw(texto, lista_kw):
+    t = str(texto).lower()
+    return any(re.search(kw, t, re.IGNORECASE) for kw in lista_kw)
+
+def fecha_en_nombre(texto):
+    t = str(texto).lower()
+    return any(re.search(p, t, re.IGNORECASE) for p in RE_FECHA_NOMBRE)
+
+def meta_os(ruta):
+    try:
+        s = os.stat(ruta)
+        fmt = lambda ts: datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+        return {"mtime": fmt(s.st_mtime), "size_kb": round(s.st_size / 1024, 1)}
+    except Exception:
+        return {"mtime": None, "size_kb": None}
+
+def es_contrasena_error(msg):
+    msg = str(msg).lower()
+    return any(x in msg for x in ["password","encrypted","proteg","contraseña",
+                                   "decrypt","workbook is encrypted"])
+
+
+# ══════════════════════════════════════════════════════════════════
+#  DESCUBRIMIENTO RECURSIVO
+# ══════════════════════════════════════════════════════════════════
+
+EXT_DATOS  = {".xls",".xlsx",".xlsm",".xlsb",".csv",".txt"}
+EXT_CORREO = {".msg"}
+
+def descubrir_archivos(raiz):
+    items = []
+    for dirpath, _, filenames in os.walk(raiz):
+        for fn in filenames:
+            if fn.startswith("~$"): continue
+            ext  = os.path.splitext(fn)[1].lower()
+            ruta = os.path.join(dirpath, fn)
+            sub  = os.path.relpath(dirpath, raiz)
+            if ext in EXT_DATOS:
+                items.append({"ruta":ruta,"tipo":"datos","subcarpeta":sub,"correo_padre":None})
+            elif ext in EXT_CORREO:
+                items.append({"ruta":ruta,"tipo":"correo","subcarpeta":sub,"correo_padre":None})
+    return items
+
+
+# ══════════════════════════════════════════════════════════════════
+#  INFERENCIA DE GRUPOS
+# ══════════════════════════════════════════════════════════════════
+
+def inferir_grupo(ruta, subcarpeta):
+    for prefijo, nombre in GRUPOS_CARPETAS.items():
+        if subcarpeta.replace("\\","/").startswith(prefijo):
+            return nombre
+    if subcarpeta and subcarpeta not in (".", ""):
+        return subcarpeta.replace("\\","/").split("/")[0].upper()
+    base = os.path.splitext(os.path.basename(ruta or "archivo"))[0]
+    limpio = re.sub(r"[\s_\-]?\d{4}[-_]?\d{0,2}[-_]?\d{0,2}","",base).strip()
+    limpio = re.sub(r"[\s_\-]+","_", limpio).upper()[:30]
+    return limpio or "SIN_GRUPO"
+
+
+# ══════════════════════════════════════════════════════════════════
+#  LECTURA DE ARCHIVOS EXCEL
+# ══════════════════════════════════════════════════════════════════
+
+def _leer_xlsb_pyxlsb(ruta):
+    """Lee .xlsb con pyxlsb."""
+    import pyxlsb
+    hojas = {}
+    for nombre_hoja in pyxlsb.open_workbook(ruta).sheets:
+        with pyxlsb.open_workbook(ruta) as wb:
+            with wb.get_sheet(nombre_hoja) as ws:
+                datos = [[c.v for c in row] for row in ws.rows()]
+        hojas[nombre_hoja] = pd.DataFrame(datos) if datos else pd.DataFrame()
+    return hojas, 0, 0, False, False, None
+
+def _leer_com(ruta):
+    """Lee cualquier formato Excel vía win32com (requiere Excel instalado)."""
+    try:
+        import win32com.client, pythoncom
+        pythoncom.CoInitialize()
+    except ImportError:
+        return {}, 0, 0, False, False, "win32com no disponible"
+
+    xl = None
+    try:
+        xl  = win32com.client.Dispatch("Excel.Application")
+        xl.Visible = False
+        xl.DisplayAlerts = False
+        wb  = xl.Workbooks.Open(os.path.abspath(ruta), ReadOnly=True, UpdateLinks=False)
+        hojas = {}
+        fml, fus = 0, 0
+        piv, tbl = False, False
+
+        for ws in wb.Worksheets:
+            try:
+                if ws.PivotTables().Count > 0: piv = True
+                if ws.ListObjects.Count > 0:   tbl = True
+                usado = ws.UsedRange
+                if usado is None:
+                    hojas[ws.Name] = pd.DataFrame(); continue
+                for cell in usado:
+                    if getattr(cell,"HasFormula",False):  fml += 1
+                    if getattr(cell,"MergeCells",False):  fus += 1
+                vals = usado.Value
+                if vals is None:
+                    hojas[ws.Name] = pd.DataFrame(); continue
+                if not isinstance(vals,(list,tuple)): vals = [[vals]]
+                hojas[ws.Name] = pd.DataFrame(list(vals))
+            except Exception:
+                hojas[ws.Name] = pd.DataFrame()
+
+        wb.Close(False)
+        return hojas, fml, fus, piv, tbl, None
+    except Exception as e:
+        return {}, 0, 0, False, False, str(e)
+    finally:
+        if xl:
+            try: xl.Quit()
+            except Exception: pass
+
+def _leer_openpyxl(ruta):
+    """
+    Lee .xlsx / .xlsm con openpyxl en DOS pasadas optimizadas:
+
+    Pasada 1 — read_only=True, data_only=True  (rápida, solo valores):
+        • Extrae DataFrames de cada hoja
+        • Cuenta fórmulas aproximadas por % de celdas con None donde se
+          esperaría valor (data_only devuelve None en celdas con fórmula
+          sin valor cacheado) → estimación suficiente para scoring
+
+    Pasada 2 — read_only=True, data_only=False  (solo metadatos):
+        • Detecta PivotTables y Tables leyendo únicamente el XML de relaciones
+        • Cuenta merged_cells desde el XML sin cargar valores
+
+    Esto evita cargar el modelo de objetos completo en modo escritura,
+    que es lo que hace read_only=False y lo que causaba la lentitud.
+    """
+    try:
+        # ── Pasada 1: valores (read_only, data_only) ──────────────
+        wb_vals = openpyxl.load_workbook(ruta, read_only=True, data_only=True)
+        hojas   = {}
+        fml_aprox = 0
+
+        for ws in wb_vals.worksheets:
+            datos = []
+            for row in ws.iter_rows(values_only=True):
+                # Saltar filas completamente vacías al final (read_only puede
+                # incluir filas fantasma más allá del rango real de datos)
+                datos.append(list(row))
+            # Recortar filas vacías finales
+            while datos and all(v is None for v in datos[-1]):
+                datos.pop()
+            df = pd.DataFrame(datos) if datos else pd.DataFrame()
+            hojas[ws.title] = df
+            # Estimar fórmulas: celdas None en columnas que deberían tener datos
+            # (data_only=True devuelve None donde hay fórmula sin cache)
+            if not df.empty:
+                fml_aprox += int(df.isnull().sum().sum() * 0.1)  # heurística conservadora
+
+        wb_vals.close()
+
+        # ── Pasada 2: metadatos estructurales (read_only, data_only=False) ──
+        # Esta pasada es muy rápida porque solo lee el ZIP interno sin valores
+        fus = 0
+        piv = False
+        tbl = False
+        try:
+            wb_meta = openpyxl.load_workbook(ruta, read_only=True, data_only=False)
+            for ws in wb_meta.worksheets:
+                # merged_cells en read_only se expone como atributo
+                try:
+                    mc = ws.merged_cells
+                    if mc:
+                        fus += len(list(mc))
+                except Exception:
+                    pass
+                if getattr(ws, "_pivots", None) or getattr(ws, "pivot_tables", None):
+                    piv = True
+            # Tables y PivotTables: leer desde el ZIP directamente
+            # (más fiable que el API de read_only)
+            import zipfile
+            with zipfile.ZipFile(ruta, "r") as z:
+                for name in z.namelist():
+                    nl = name.lower()
+                    if "pivottable" in nl:  piv = True
+                    if "table"      in nl and "pivottable" not in nl: tbl = True
+            wb_meta.close()
+        except Exception:
+            pass  # metadatos opcionales, no bloquear
+
+        return hojas, fml_aprox, fus, piv, tbl, None
+
+    except Exception as e:
+        return {}, 0, 0, False, False, str(e)
+
+def _leer_xlrd(ruta):
+    """Lee .xls con xlrd (v1.2.0)."""
+    try:
+        import xlrd
+        wb  = xlrd.open_workbook(ruta, formatting_info=True)
+        hojas = {}
+        fml, fus = 0, 0
+        for sh in wb.sheets():
+            fus += len(sh.merged_cells())
+            datos = []
+            for r in range(sh.nrows):
+                fila = []
+                for c in range(sh.ncols):
+                    cell = sh.cell(r,c)
+                    if cell.ctype == xlrd.XL_CELL_TEXT and str(cell.value).startswith("="):
+                        fml += 1
+                    fila.append(cell.value)
+                datos.append(fila)
+            hojas[sh.name] = pd.DataFrame(datos) if datos else pd.DataFrame()
+        return hojas, fml, fus, False, False, None
+    except ImportError:
+        return {}, 0, 0, False, False, "xlrd no instalado – instala xlrd==1.2.0"
+    except Exception as e:
+        return {}, 0, 0, False, False, str(e)
+
+def detectar_contrasena(ruta):
+    """
+    Intenta detectar si el archivo está protegido con contraseña
+    usando msoffcrypto-tool. Retorna True/False/None(no disponible).
+    """
+    try:
+        import msoffcrypto
+        with open(ruta,"rb") as f:
+            office = msoffcrypto.OfficeFile(f)
+            return office.is_encrypted()
+    except ImportError:
+        return None   # librería no disponible
+    except Exception:
+        return None
+
+def leer_excel(ruta):
+    """
+    Dispatcher principal. Intenta en orden:
+      xlsb → pyxlsb → COM
+      xls  → xlrd  → COM
+      xlsx/xlsm → openpyxl → COM
+    Detecta contraseña y asigna G=0 si corresponde.
+    """
+    ext = os.path.splitext(ruta)[1].lower()
+
+    # ── Detección de contraseña ANTES de intentar leer ───────────
+    tiene_pwd = detectar_contrasena(ruta)
+
+    if ext == ".xlsb":
+        try:
+            res = _leer_xlsb_pyxlsb(ruta)
+            if res[5] is None: return res + (tiene_pwd,)
+        except Exception: pass
+        res = _leer_com(ruta)
+        return res + (tiene_pwd,)
+
+    if ext == ".xls":
+        hojas,fml,fus,piv,tbl,err = _leer_xlrd(ruta)
+        if err and ("xlrd" in err.lower() or not hojas):
+            # Mensaje claro en lugar del error críptico de xlrd
+            if "xlsx" in str(err).lower() or "xlrd" in str(err).lower():
+                err = (f"xlrd solo soporta .xls (Excel 97-2003). "
+                       f"Si este archivo es realmente .xlsx renombrado, "
+                       f"cámbiala extensión a .xlsx.")
+            hojas,fml,fus,piv,tbl,err2 = _leer_com(ruta)
+            if err2: err = f"xlrd: {err} | COM: {err2}"
+            else:    err = None
+        return hojas, fml, fus, piv, tbl, err, tiene_pwd
+
+    # xlsx / xlsm
+    hojas,fml,fus,piv,tbl,err = _leer_openpyxl(ruta)
+    if err:
+        if es_contrasena_error(err):
+            tiene_pwd = True
+            return {}, fml, fus, piv, tbl, err, True
+        hojas,fml,fus,piv,tbl,err = _leer_com(ruta)
+    return hojas, fml, fus, piv, tbl, err, tiene_pwd
+
+
+# ══════════════════════════════════════════════════════════════════
+#  LECTURA CSV / TXT
+# ══════════════════════════════════════════════════════════════════
+
+def detectar_encoding(datos_bytes=None, ruta=None):
+    try:
+        muestra = datos_bytes[:50_000] if datos_bytes else open(ruta,"rb").read(50_000)
+        enc = chardet.detect(muestra).get("encoding") or "utf-8"
+        return enc.replace("ISO-8859-1","latin-1").replace("Windows-1252","cp1252")
+    except Exception:
+        return "utf-8"
+
+def detectar_sep(texto, n=5):
+    lineas = [l for l in texto.splitlines()[:n] if l.strip()]
+    if not lineas: return ","
+    mejor, mc = ",", 0
+    for sep in [",","\t",";","|"]:
+        cnt = [len(l.split(sep)) for l in lineas]
+        if len(set(cnt))==1 and cnt[0] > mc:
+            mc, mejor = cnt[0], sep
+    return mejor
+
+def leer_csv_txt(ruta=None, datos_bytes=None):
+    enc  = detectar_encoding(datos_bytes=datos_bytes, ruta=ruta)
+    txt  = (datos_bytes.decode(enc,errors="replace") if datos_bytes
+            else open(ruta,"r",encoding=enc,errors="replace").read())
+    sep  = detectar_sep(txt)
+    df   = pd.read_csv(io.StringIO(txt), sep=sep, dtype=str, on_bad_lines="skip")
+    return df, sep, enc
+
+
+# ══════════════════════════════════════════════════════════════════
+#  EXTRACCIÓN DE ADJUNTOS .MSG
+# ══════════════════════════════════════════════════════════════════
+
+def extraer_adjuntos_msg(ruta_msg):
+    try:
+        import extract_msg
+    except ImportError:
+        return [], [], "Instala extract-msg: pip install extract-msg"
+    adj_info, datos_ext = [], []
+    try:
+        msg = extract_msg.Message(ruta_msg)
+        asunto = msg.subject or "(sin asunto)"
+        remit  = msg.sender  or "?"
+        fecha  = str(msg.date or "?")
+        for att in msg.attachments:
+            nombre = att.longFilename or att.shortFilename or "adjunto"
+            ext    = os.path.splitext(nombre)[1].lower()
+            datos  = att.data if hasattr(att,"data") else None
+            es_d   = ext in EXT_DATOS
+            adj_info.append({"correo":os.path.basename(ruta_msg),"ruta_correo":ruta_msg,
+                             "asunto":asunto,"remitente":remit,"fecha_correo":fecha,
+                             "adjunto":nombre,"extension":ext,
+                             "tamanio_kb":round(len(datos)/1024,1) if datos else None,
+                             "es_dato":es_d})
+            if es_d and datos:
+                datos_ext.append((nombre, ext, datos, asunto, remit, fecha))
+        msg.close()
+    except Exception as e:
+        return [], [], str(e)
+    return adj_info, datos_ext, None
+
+
+# ══════════════════════════════════════════════════════════════════
+#  ANÁLISIS DE DataFrame → métricas de hoja
+# ══════════════════════════════════════════════════════════════════
+
+def primera_fila_datos(df):
+    """
+    Detecta la primera fila no completamente vacía.
+    Vectorizado: ~50x más rápido que iterrows() en hojas grandes.
+    """
+    if df.empty:
+        return 0
+    mask = df.notna().any(axis=1)
+    if not mask.any():
+        return 0
+    return int(mask.idxmax())
+
+
+def _aplicar_encabezado(df_raw, hr):
+    """
+    Asigna encabezado a un DataFrame crudo sin releer el archivo.
+    Elimina la tercera lectura con pd.read_excel.
+    """
+    if df_raw is None or df_raw.empty:
+        return df_raw
+    df = df_raw.iloc[hr:].reset_index(drop=True) if hr > 0 else df_raw.copy()
+    if df.empty:
+        return df
+    nuevos_cols = [
+        str(v).strip() if (v is not None and str(v).strip() != "") else f"Col_{i}"
+        for i, v in enumerate(df.iloc[0])
+    ]
+    df.columns = nuevos_cols
+    df = df.iloc[1:].reset_index(drop=True)
+
+    # Inferir tipos: openpyxl read_only devuelve todo como object con valores
+    # Python nativos (int, float, str, datetime). infer_objects() + conversión
+    # explícita de datetime evita errores en analizar_df.
+    try:
+        df = df.infer_objects()
+        for col in df.columns:
+            if df[col].dtype == object:
+                # Intentar convertir a numérico primero
+                convertida = pd.to_numeric(df[col], errors="coerce")
+                if convertida.notna().sum() / max(df[col].notna().sum(), 1) > 0.8:
+                    df[col] = convertida
+                else:
+                    # Intentar convertir a datetime
+                    try:
+                        convertida_dt = pd.to_datetime(df[col], errors="coerce",
+                                                       infer_datetime_format=True)
+                        if convertida_dt.notna().sum() / max(df[col].notna().sum(), 1) > 0.8:
+                            df[col] = convertida_dt
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return df
+
+
+def _hoja_vacia():
+    return {"vacia":True,"filas_totales":0,"filas_con_datos":0,"filas_en_blanco":0,
+            "num_columnas":0,"nombres_columnas":[],"pct_columnas_limpias":0.0,
+            "pct_nulos":{},"tipos":{},"columnas_mixtas":[],"fila_encabezado":0,
+            "encabezado_en_fila1":True}
+
+def analizar_df(df, nombre_hoja=""):
+    if df is None or df.empty or df.dropna(how="all").empty:
+        return {**_hoja_vacia(), "nombre":nombre_hoja}
+    df_sin = df.dropna(how="all")
+    cols   = [str(c) for c in df.columns]
+    limpias= sum(1 for c in cols
+                 if not c.startswith("Unnamed") and c.strip()!="" and
+                    not re.search(r"[^a-zA-Z0-9áéíóúÁÉÍÓÚñÑüÜ _\-./()]",c))
+    tipos, mixtas = {}, []
+    for col in df.columns:
+        s  = df[col].dropna()
+        if s.empty: tipos[str(col)]="vacío"; continue
+        try:
+            tp = str(df[col].dtype)
+        except Exception:
+            tp = "object"
+        if "int" in tp or "float" in tp:   tipos[str(col)]="numérico"
+        elif "datetime" in tp:             tipos[str(col)]="fecha"
+        elif "bool"     in tp:             tipos[str(col)]="booleano"
+        else:
+            try:
+                n = pd.to_numeric(s, errors="coerce").notna().sum()
+                t = s.apply(lambda x: isinstance(x, str)).sum()
+                if n > 0 and t > 0: tipos[str(col)]="mixto"; mixtas.append(str(col))
+                else:               tipos[str(col)]="texto"
+            except Exception:
+                tipos[str(col)]="texto"
+
+    # isnull robusto: algunos dtypes object con datetimes nativos pueden fallar
+    try:
+        pct_nulos = df.isnull().mean().mul(100).round(1).to_dict()
+    except Exception:
+        pct_nulos = {}
+        for col in df.columns:
+            try:
+                pct_nulos[str(col)] = round(df[col].isnull().mean() * 100, 1)
+            except Exception:
+                pct_nulos[str(col)] = 0.0
+    return {"vacia":False,"nombre":nombre_hoja,
+            "filas_totales":df.shape[0],"filas_con_datos":df_sin.shape[0],
+            "filas_en_blanco":df.shape[0]-df_sin.shape[0],
+            "num_columnas":len(cols),"nombres_columnas":cols,
+            "pct_columnas_limpias":round(limpias/max(len(cols),1)*100,1),
+            "pct_nulos":pct_nulos,
+            "tipos":tipos,"columnas_mixtas":mixtas}
+
+
+# ══════════════════════════════════════════════════════════════════
+#  ANÁLISIS COMPLETO DE UN ARCHIVO
+# ══════════════════════════════════════════════════════════════════
+
+def analizar_archivo(item, ctx_grupo=None):
+    ruta         = item.get("ruta")
+    nombre       = item.get("nombre_display") or (os.path.basename(ruta) if ruta else "?")
+    ext          = os.path.splitext(nombre)[1].lower()
+    es_csv       = ext in (".csv",".txt")
+    datos_bytes  = item.get("bytes")
+    correo_padre = item.get("correo_padre","")
+    asunto       = item.get("asunto_correo","")
+    remit        = item.get("remitente","")
+    fecha_correo = item.get("fecha_correo","")
+    meta         = meta_os(ruta) if ruta else {"mtime":None,"size_kb":None}
+    grupo        = item.get("grupo","SIN_GRUPO")
+
+    r = {"archivo":nombre, "ruta":ruta or "(en correo)", "subcarpeta":item.get("subcarpeta",""),
+         "grupo":grupo, "formato":ext.lstrip("."), "origen":"adjunto" if correo_padre else "directo",
+         "correo_padre":correo_padre, "asunto_correo":asunto, "remitente":remit,
+         "fecha_correo":fecha_correo, "mtime":meta["mtime"],
+         "tamanio_kb":len(datos_bytes)/1024 if datos_bytes else meta["size_kb"],
+         "num_hojas":0, "total_formulas":0, "fusionadas":0,
+         "tiene_pivot":False, "tiene_table":False, "tiene_pwd":False,
+         "hojas":[], "separador":"N/A", "encoding":"N/A",
+         "error_lectura":None, "niveles":{}, "niveles_auto":{}}
+
+    # ── LEER ─────────────────────────────────────────────────────
+    hojas_raw = {}
+    if es_csv:
+        try:
+            df, sep, enc = leer_csv_txt(ruta=ruta if not datos_bytes else None,
+                                        datos_bytes=datos_bytes)
+            hojas_raw = {"datos": df}
+            r.update({"separador":repr(sep),"encoding":enc,"num_hojas":1})
+        except Exception as e:
+            r["error_lectura"] = str(e)
+    else:
+        res = leer_excel(ruta)  # retorna 7 valores
+        hojas_raw,fml,fus,piv,tbl,err,tiene_pwd = res
+        r.update({"total_formulas":fml,"fusionadas":fus,"tiene_pivot":piv,
+                  "tiene_table":tbl,"num_hojas":len(hojas_raw),
+                  "error_lectura":err,"tiene_pwd":bool(tiene_pwd)})
+
+    # ── ANALIZAR HOJAS ────────────────────────────────────────────
+    todos_cols = []
+    filas_vacias_max = 0
+    hojas_con_datos  = 0
+
+    for nombre_hoja, df_raw in hojas_raw.items():
+        if df_raw is None or df_raw.empty:
+            r["hojas"].append({**_hoja_vacia(),"nombre":nombre_hoja}); continue
+
+        hr = primera_fila_datos(df_raw)
+        filas_vacias_max = max(filas_vacias_max, hr)
+
+        # Asignar encabezado desde el DataFrame ya en memoria (sin releer el archivo)
+        try:
+            df = _aplicar_encabezado(df_raw, hr)
+        except Exception:
+            df = df_raw
+
+        m = analizar_df(df, nombre_hoja)
+        m["fila_encabezado"]    = int(hr)
+        m["encabezado_en_fila1"] = hr == 0
+        r["hojas"].append(m)
+        if not m["vacia"]:
+            hojas_con_datos += 1
+            todos_cols.extend(m["nombres_columnas"])
+
+    # ── ESTIMAR NIVELES ───────────────────────────────────────────
+    nv, na = {}, {}   # niveles, niveles_auto (True=automático, False=estimado)
+    txt = " ".join([nombre, asunto, remit,
+                    " ".join(todos_cols), item.get("subcarpeta","")]).lower()
+
+    # A – Fecha de la fuente
+    tiene_col_fecha = any(re.search(r"fecha|date|period|mes|month",str(c),re.I)
+                          for c in todos_cols)
+    if tiene_col_fecha: nv["A"] = 0
+    elif fecha_en_nombre(nombre): nv["A"] = 1
+    elif fecha_correo:  nv["A"] = 2
+    elif meta["mtime"]: nv["A"] = 3
+    else:               nv["A"] = 4
+    na["A"] = True
+
+    # B – Cod cliente ERP
+    if tiene_kw(" ".join(todos_cols), KW_CLIENTE):       nv["B"] = 0
+    elif tiene_kw(nombre, KW_CLIENTE) or \
+         tiene_kw(asunto, KW_CLIENTE):                   nv["B"] = 1
+    elif remit and "@" in remit:                          nv["B"] = 2
+    elif grupo != "SIN_GRUPO":                            nv["B"] = 3
+    else:                                                 nv["B"] = 4
+    na["B"] = False
+
+    # C – Periodo
+    tipos_flat = {}
+    for h in r["hojas"]: tipos_flat.update(h.get("tipos",{}))
+    cols_fecha_tipo = [c for c,t in tipos_flat.items()
+                       if t=="fecha" and re.search(r"fecha|date|period|mes|month",str(c),re.I)]
+    if cols_fecha_tipo:                nv["C"] = 0
+    elif tiene_kw(" ".join(todos_cols),KW_PERIODO) and not cols_fecha_tipo: nv["C"] = 1
+    elif fecha_en_nombre(nombre):
+        limpio = re.sub(r"[\s_\-]?\d{4}[-_]?\d{0,2}","",nombre)
+        nv["C"] = 3 if len(limpio) < len(nombre)*0.6 else 4
+    else:                              nv["C"] = 5
+    na["C"] = True
+
+    # D – Frecuencia
+    if ctx_grupo and len(ctx_grupo) >= 3: nv["D"] = 0
+    elif correo_padre:                     nv["D"] = 2
+    else:                                  nv["D"] = 1
+    na["D"] = False
+
+    # E – Nombres de columnas (placeholder si hay grupo; se recalcula después)
+    if ctx_grupo and len(ctx_grupo) > 1:
+        nv["E"] = None
+    else:
+        pct = 0
+        vls = [h["pct_columnas_limpias"] for h in r["hojas"] if not h["vacia"]]
+        if vls: pct = sum(vls)/len(vls)
+        nv["E"] = 1 if pct >= 80 else (3 if pct >= 40 else 10)
+    na["E"] = True
+
+    # F – Fuente
+    if correo_padre:                      nv["F"] = 2
+    elif item.get("subcarpeta",".") != ".": nv["F"] = 1
+    else:                                  nv["F"] = 3
+    na["F"] = False
+
+    # G – Integridad (con detección de contraseña)
+    if r["tiene_pwd"]:                               nv["G"] = 0
+    elif r["error_lectura"] and not r["hojas"]:      nv["G"] = 10
+    elif r["error_lectura"]:                         nv["G"] = 2
+    else:                                            nv["G"] = 1
+    na["G"] = True
+
+    # H – Cantidad de hojas
+    nh = r["num_hojas"]
+    if nh == 1 and hojas_con_datos == 1:             nv["H"] = 0
+    elif hojas_con_datos == nh:                      nv["H"] = 1
+    elif hojas_con_datos < nh:                       nv["H"] = 2
+    else:                                            nv["H"] = 3
+    na["H"] = True
+
+    # I – Elementos creados
+    if r["tiene_pivot"] and r["tiene_table"]:        nv["I"] = 3
+    elif r["tiene_pivot"]:                           nv["I"] = 2
+    elif r["tiene_table"]:                           nv["I"] = 1
+    elif hojas_con_datos > 0:                        nv["I"] = 0
+    else:                                            nv["I"] = 10
+    na["I"] = True
+
+    # J – Limpieza tabular
+    fus = r["fusionadas"]
+    mixtas_total = sum(len(h.get("columnas_mixtas",[])) for h in r["hojas"])
+    enc_ok = sum(1 for h in r["hojas"] if not h["vacia"] and h.get("encabezado_en_fila1"))
+    nulos_all = [v for h in r["hojas"] if not h["vacia"]
+                 for v in h.get("pct_nulos",{}).values()]
+    prom_nulos = sum(nulos_all)/max(len(nulos_all),1) if nulos_all else 0
+
+    if filas_vacias_max==0 and fus==0 and mixtas_total==0 and enc_ok==hojas_con_datos:
+        nv["J"] = 0 if prom_nulos < 5 else 1
+    elif 0 < filas_vacias_max <= 5:  nv["J"] = 2
+    elif filas_vacias_max > 5:       nv["J"] = 3
+    elif fus > 20:                   nv["J"] = 4
+    else:                            nv["J"] = 1
+    na["J"] = True
+
+    # K – Normalización
+    if fus > 50 or mixtas_total > 5:       nv["K"] = 3
+    elif r["tiene_pivot"]:                 nv["K"] = 2
+    elif fus > 10 or mixtas_total > 2:     nv["K"] = 1
+    else:                                  nv["K"] = 0
+    na["K"] = True
+
+    # L – Referencias producto
+    d56   = any(re.search(r"\bd56\b",str(c),re.I) for c in todos_cols)
+    abbott= any(re.search(r"(cod|ref|sku)[\s_]?(abbott|prod)",str(c),re.I) for c in todos_cols)
+    cod_c = any(re.search(r"(cod|ref|sku|item)",str(c),re.I) for c in todos_cols)
+    nom_p = tiene_kw(" ".join(todos_cols), KW_PRODUCTO)
+    if d56:    nv["L"] = 0
+    elif abbott: nv["L"] = 1
+    elif cod_c:  nv["L"] = 2
+    elif nom_p:  nv["L"] = 3
+    else:        nv["L"] = 4
+    na["L"] = False
+
+    # M – Unidades
+    cu = [c for c in todos_cols if tiene_kw(str(c), KW_UNIDAD)]
+    if len(cu) == 1:                       nv["M"] = 0
+    elif len(cu) > 1:                      nv["M"] = 1
+    elif any(re.search(r"uom|unidad_medida|unit_measure",str(c),re.I)
+             for c in todos_cols):         nv["M"] = 2
+    else:                                  nv["M"] = 3
+    na["M"] = False
+
+    # N – Propósito
+    en_col  = tiene_kw(" ".join(todos_cols), KW_VENTAS+KW_INVENTARIO+KW_IMS)
+    en_nom  = tiene_kw(nombre+asunto, KW_VENTAS+KW_INVENTARIO+KW_IMS)
+    if en_col and en_nom:  nv["N"] = 0
+    elif en_col:           nv["N"] = 1
+    else:                  nv["N"] = 2
+    na["N"] = True
+
+    # O – Valor monetario
+    cv = [c for c in todos_cols if tiene_kw(str(c), KW_VALOR)]
+    tm = tiene_kw(txt, KW_MONEDA)
+    if len(cv)==1 and tm:   nv["O"] = 0
+    elif len(cv)>1 and tm:  nv["O"] = 1
+    elif cv and not tm:     nv["O"] = 2
+    else:                   nv["O"] = 3
+    na["O"] = False
+
+    r["niveles"]      = nv
+    r["niveles_auto"] = na
+    return r
+
+
+# ══════════════════════════════════════════════════════════════════
+#  REGLA E: CONSISTENCIA POR GRUPO
+# ══════════════════════════════════════════════════════════════════
+
+def recalcular_E_por_grupo(grupos):
+    for grupo, archivos in grupos.items():
+        esquemas = []
+        for ar in archivos:
+            for h in ar["hojas"]:
+                if not h["vacia"]:
+                    esquemas.append(frozenset(h["nombres_columnas"]))
+
+        if not esquemas or len(archivos) == 1:
+            # Archivo único: marcar como "no evaluable por grupo"
+            for ar in archivos:
+                if ar["niveles"].get("E") is None:
+                    vls = [h["pct_columnas_limpias"] for h in ar["hojas"] if not h["vacia"]]
+                    p   = sum(vls)/len(vls) if vls else 0
+                    ar["niveles"]["E"] = 1 if p>=80 else (3 if p>=40 else 10)
+            continue
+
+        ref = esquemas[0]
+        sims = [len(e & ref)/max(len(e | ref),1) for e in esquemas]
+        sim  = sum(sims)/len(sims)
+
+        for ar in archivos:
+            if   sim >= 0.95: ar["niveles"]["E"] = 1
+            elif sim >= 0.80: ar["niveles"]["E"] = 2
+            elif sim >= 0.50: ar["niveles"]["E"] = 3
+            else:             ar["niveles"]["E"] = 10
+
+
+# ══════════════════════════════════════════════════════════════════
+#  SCORING
+# ══════════════════════════════════════════════════════════════════
+
+def calcular_score(niveles):
+    score_d = {}
+    techo   = 100
+    bloqueo = None
+
+    peso_ef = sum(REGLAS[c]["peso"] for c,n in niveles.items()
+                  if n is not None and c in REGLAS)
+    if peso_ef == 0:
+        return {c:None for c in REGLAS}, 0, "⛔ No evaluable", None
+
+    for cod, cfg in REGLAS.items():
+        n = niveles.get(cod)
+        if n is None:
+            score_d[cod] = None; continue
+        max_n = cfg["max_nivel_normal"]
+        if n == 10 and cfg["bloqueo"]:
+            score_d[cod] = 0.0
+            if cfg["techo"] is not None and cfg["techo"] < techo:
+                techo   = cfg["techo"]
+                bloqueo = cod
+        else:
+            frac = 1.0 - min(n, max_n) / max_n
+            score_d[cod] = round(frac * cfg["peso"] / PESO_TOTAL_RAW * 100, 2)
+
+    base   = sum(v for v in score_d.values() if v is not None)
+    factor = PESO_TOTAL_RAW / max(peso_ef, 1)
+    base   = min(round(base * factor, 1), 100)
+    final  = min(base, techo)
+
+    if   final >= 85: cat = "🟢 Automatizable"
+    elif final >= 65: cat = "🟡 Automatizable con controladores"
+    elif final >= 40: cat = "🟠 Automatizable con esfuerzo"
+    elif final >= 20: cat = "🔴 Difícil"
+    else:             cat = "⛔ No automatizable"
+
+    return score_d, final, cat, bloqueo
+
+
+# ══════════════════════════════════════════════════════════════════
+#  HELPERS DE FORMATO EXCEL
+# ══════════════════════════════════════════════════════════════════
+
+COLORES_CAT = {
+    "🟢 Automatizable":                   "C6EFCE",
+    "🟡 Automatizable con controladores": "FFEB9C",
+    "🟠 Automatizable con esfuerzo":      "FFCC99",
+    "🔴 Difícil":                         "FFC7CE",
+    "⛔ No automatizable":                "D9D9D9",
+    "⛔ No evaluable":                    "EEEEEE",
+}
+
+def _hdr(cell, bg="1F4E79", sz=9):
+    cell.font      = Font(bold=True, color="FFFFFF", name="Arial", size=sz)
+    cell.fill      = PatternFill("solid", fgColor=bg)
+    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    b = Side(style="thin", color="AAAAAA")
+    cell.border    = Border(left=b, right=b, top=b, bottom=b)
+
+def _cel(cell, val=None, bold=False, color=None, bg=None, sz=9, wrap=False, h="center"):
+    if val is not None: cell.value = val
+    cell.font      = Font(bold=bold, name="Arial", size=sz,
+                          color=color or "000000")
+    cell.alignment = Alignment(horizontal=h, vertical="center", wrap_text=wrap)
+    b = Side(style="thin", color="DDDDDD")
+    cell.border    = Border(left=b, right=b, top=b, bottom=b)
+    if bg:
+        cell.fill  = PatternFill("solid", fgColor=bg)
+
+def _aw(ws, max_w=50):
+    for col in ws.columns:
+        w = max(len(str(c.value or "")) for c in col)
+        ws.column_dimensions[get_column_letter(col[0].column)].width = min(w+3, max_w)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  HOJA DASHBOARD
+# ══════════════════════════════════════════════════════════════════
+
+def hoja_dashboard(wb, resultados):
+    ws = wb.create_sheet("DASHBOARD")
+    ws.sheet_view.showGridLines = False
+
+    scores_cats = [(calcular_score(r["niveles"])[1],
+                    calcular_score(r["niveles"])[2],
+                    r) for r in resultados]
+
+    # ── Título ───────────────────────────────────────────────────
+    ws.merge_cells("A1:J1")
+    c = ws["A1"]
+    c.value = "Abbott Laboratories — Reporte de Automatizabilidad de Archivos"
+    c.font  = Font(bold=True, name="Arial", size=14, color="FFFFFF")
+    c.fill  = PatternFill("solid", fgColor="1F4E79")
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 35
+
+    ws.merge_cells("A2:J2")
+    ws["A2"].value = f"Generado: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}  |  Total archivos: {len(resultados)}"
+    ws["A2"].font  = Font(italic=True, name="Arial", size=9, color="666666")
+    ws["A2"].alignment = Alignment(horizontal="center")
+
+    # ── KPIs (fila 4-8, cols A-D) ────────────────────────────────
+    scores_vals = [s for s,_,_ in scores_cats]
+    cats_count  = defaultdict(int)
+    for _,c_,_ in scores_cats: cats_count[c_] += 1
+
+    kpis = [
+        ("Score Promedio",   f"{round(sum(scores_vals)/max(len(scores_vals),1),1)}",  "2E4057"),
+        ("Score Máximo",     f"{max(scores_vals, default=0)}",                         "1A7A4A"),
+        ("Score Mínimo",     f"{min(scores_vals, default=0)}",                         "C00000"),
+        ("Total Archivos",   str(len(resultados)),                                     "1F4E79"),
+    ]
+    for i, (label, val, color) in enumerate(kpis):
+        row = 4 + i
+        ws.merge_cells(f"A{row}:B{row}")
+        _cel(ws[f"A{row}"], label, bold=True, h="left", sz=10)
+        ws.merge_cells(f"C{row}:D{row}")
+        _cel(ws[f"C{row}"], val, bold=True, color=color, sz=14, h="center")
+
+    # ── Distribución por categoría (fila 4-9, cols F-H) ──────────
+    ws.merge_cells("F3:H3")
+    _hdr(ws["F3"], "2E4057")
+    ws["F3"].value = "Distribución por Categoría"
+
+    for i, (cat, bg) in enumerate(COLORES_CAT.items(), 4):
+        ws.merge_cells(f"F{i}:G{i}")
+        _cel(ws[f"F{i}"], cat, h="left", bg=bg)
+        _cel(ws[f"H{i}"], cats_count.get(cat, 0), bold=True)
+
+    # ── Top 5 más automatizables (fila 12+) ──────────────────────
+    ordenados = sorted(scores_cats, key=lambda x: x[0], reverse=True)
+    ws.merge_cells("A11:E11")
+    _hdr(ws["A11"], "1A7A4A")
+    ws["A11"].value = "🏆  Top 5 más automatizables"
+    for j,h in enumerate(["Archivo","Grupo","Score","Categoría","Formato"],1):
+        _hdr(ws.cell(12, j), "2E7D32")
+        ws.cell(12, j).value = h
+    for i, (sc, cat, r) in enumerate(ordenados[:5], 13):
+        vals = [r["archivo"][:40], r["grupo"], sc, cat, r["formato"]]
+        for j, v in enumerate(vals, 1):
+            _cel(ws.cell(i, j), v, bg=COLORES_CAT.get(cat,"FFFFFF"), h="left" if j==1 else "center")
+
+    # ── Top 5 menos automatizables (fila 12+, cols G-K) ──────────
+    ws.merge_cells("G11:K11")
+    _hdr(ws["G11"], "C00000")
+    ws["G11"].value = "⚠️  Top 5 menos automatizables"
+    for j,h in enumerate(["Archivo","Grupo","Score","Categoría","Bloqueo"],1):
+        _hdr(ws.cell(12, j+6), "9C1B1B")
+        ws.cell(12, j+6).value = h
+    for i, (sc, cat, r) in enumerate(reversed(ordenados[-5:]), 13):
+        _, _, _, blq = calcular_score(r["niveles"])
+        vals = [r["archivo"][:40], r["grupo"], sc, cat, blq or ""]
+        for j, v in enumerate(vals, 1):
+            _cel(ws.cell(i, j+6), v, bg=COLORES_CAT.get(cat,"FFFFFF"),
+                 h="left" if j==1 else "center")
+
+    # ── Score por grupo (fila 20+) ────────────────────────────────
+    grupos_scores = defaultdict(list)
+    for sc, _, r in scores_cats:
+        grupos_scores[r["grupo"]].append(sc)
+
+    ws.merge_cells("A20:E20")
+    _hdr(ws["A20"], "1F4E79")
+    ws["A20"].value = "📊  Score promedio por grupo"
+    for j,h in enumerate(["Grupo","Archivos","Score Promedio","Score Mín","Score Máx"],1):
+        _hdr(ws.cell(21, j), "2E4057")
+        ws.cell(21, j).value = h
+    for i, (g, scs) in enumerate(sorted(grupos_scores.items(),
+                                         key=lambda x:-sum(x[1])/len(x[1])), 22):
+        prom = round(sum(scs)/len(scs),1)
+        _cel(ws.cell(i,1), g,          h="left")
+        _cel(ws.cell(i,2), len(scs),   h="center")
+        _cel(ws.cell(i,3), prom,       bold=True, h="center")
+        _cel(ws.cell(i,4), min(scs),   h="center")
+        _cel(ws.cell(i,5), max(scs),   h="center")
+
+    for col in ["A","B","C","D","E","F","G","H","I","J","K"]:
+        ws.column_dimensions[col].width = 22
+    ws.row_dimensions[1].height = 35
+
+
+# ══════════════════════════════════════════════════════════════════
+#  HOJA SCORING (interactiva con overrides)
+# ══════════════════════════════════════════════════════════════════
+
+def hoja_scoring(wb, resultados):
+    ws = wb.create_sheet("SCORING")
+    ws.sheet_view.showGridLines = False
+    ws.freeze_panes = "D3"
+
+    # Instrucciones
+    last_col = get_column_letter(8 + len(REGLAS) * 2)
+    ws.merge_cells(f"A1:{last_col}1")
+    ws["A1"].value = (
+        "⚠️  INSTRUCCIONES: Columnas en AMARILLO = estimadas automáticamente — "
+        "verifica y corrige el nivel en la columna 'Override' correspondiente. "
+        "El Score Final recalcula automáticamente al modificar cualquier Override. "
+        "Niveles válidos: ver hoja REFERENCIA."
+    )
+    ws["A1"].font      = Font(bold=True, italic=True, color="7F3F00", name="Arial", size=9)
+    ws["A1"].fill      = PatternFill("solid", fgColor="FFF2CC")
+    ws["A1"].alignment = Alignment(wrap_text=True, horizontal="center")
+    ws.row_dimensions[1].height = 30
+
+    # Encabezados fila 2
+    cols_fijas = ["Archivo","Grupo","Formato","Origen","Correo Padre",
+                  "Score Final","Categoría","Bloqueo"]
+    cols_extra = []
+    for cod, cfg in REGLAS.items():
+        es_est = cfg["auto"] == "estimado"
+        cols_extra.append(f"{cod} – {cfg['descripcion'][:15]}\nDetectado")
+        cols_extra.append(f"{cod} Override{'⚠' if es_est else ''}")
+
+    cols_tail = ["Tamaño KB","Hojas","Fórmulas","Fusionadas","Pivot","Table","Contraseña"]
+    todas = cols_fijas + cols_extra + cols_tail
+
+    for j, h in enumerate(todas, 1):
+        c = ws.cell(row=2, column=j, value=h)
+        if j <= len(cols_fijas):
+            _hdr(c, "1F4E79")
+        elif "Override" in h and "⚠" in h:
+            _hdr(c, "7F6000")
+        elif "Override" in h:
+            _hdr(c, "2E4057")
+        else:
+            _hdr(c, "2E4057")
+    ws.row_dimensions[2].height = 40
+
+    # Datos fila 3+
+    for i, r in enumerate(resultados, 3):
+        nv = r.get("niveles", {})
+        na = r.get("niveles_auto", {})
+        _, _, cat, blq = calcular_score(nv)
+
+        fila = [r["archivo"], r["grupo"], r["formato"], r["origen"],
+                r["correo_padre"], None, cat, blq or ""]
+
+        col_ov_map = {}  # cod → col_letra del override
+        k = 0
+        for cod in REGLAS:
+            col_det = len(cols_fijas) + k*2 + 1
+            col_ov  = len(cols_fijas) + k*2 + 2
+            col_ov_map[cod] = get_column_letter(col_ov)
+            fila.append(nv.get(cod, ""))
+            fila.append("")   # override vacío
+            k += 1
+
+        fila += [r.get("tamanio_kb"), r.get("num_hojas"),
+                 r.get("total_formulas"), r.get("fusionadas"),
+                 "Sí" if r.get("tiene_pivot") else "No",
+                 "Sí" if r.get("tiene_table") else "No",
+                 "Sí" if r.get("tiene_pwd")   else "No"]
+
+        for j, val in enumerate(fila, 1):
+            c = ws.cell(row=i, column=j, value=val)
+            c.font      = Font(name="Arial", size=9)
+            c.alignment = Alignment(horizontal="center", vertical="center")
+            b = Side(style="thin", color="DDDDDD")
+            c.border    = Border(left=b, right=b, top=b, bottom=b)
+
+        # Colorear columnas override estimadas en amarillo
+        k = 0
+        for cod, cfg in REGLAS.items():
+            if cfg["auto"] == "estimado":
+                col_ov = len(cols_fijas) + k*2 + 2
+                ws.cell(i, col_ov).fill = PatternFill("solid", fgColor="FFF2CC")
+            k += 1
+
+        # Color de fila (cols fijas) por categoría
+        fill_cat = PatternFill("solid", fgColor=COLORES_CAT.get(cat,"FFFFFF"))
+        for j in range(1, len(cols_fijas)+1):
+            ws.cell(i, j).fill = fill_cat
+
+        # ── Fórmula Excel dinámica para Score Final ───────────────
+        partes, techos = [], []
+        k = 0
+        for cod, cfg in REGLAS.items():
+            col_det = get_column_letter(len(cols_fijas) + k*2 + 1)
+            col_ov  = get_column_letter(len(cols_fijas) + k*2 + 2)
+            max_n   = cfg["max_nivel_normal"]
+            peso    = cfg["peso"]
+
+            nivel_expr = f'IF({col_ov}{i}<>"",{col_ov}{i},{col_det}{i})'
+            nivel_safe = f'IFERROR({nivel_expr},0)'
+
+            if cfg["bloqueo"]:
+                pts = (f'IF({nivel_safe}=10,0,'
+                       f'(1-MIN({nivel_safe},{max_n})/{max_n})*{peso}/{PESO_TOTAL_RAW}*100)')
+                techos.append(f'IF({nivel_safe}=10,{cfg["techo"]},100)')
+            else:
+                pts = f'(1-MIN(IFERROR({nivel_expr},0),{max_n})/{max_n})*{peso}/{PESO_TOTAL_RAW}*100'
+
+            partes.append(pts)
+            k += 1
+
+        suma = "+".join(partes)
+        if techos:
+            techo_expr = "MIN(" + ",".join(techos) + ")"
+            formula = f"=MIN(ROUND({suma},1),{techo_expr})"
+        else:
+            formula = f"=ROUND({suma},1)"
+
+        c_score = ws.cell(i, 6, value=formula)
+        c_score.font      = Font(name="Arial", size=9, bold=True)
+        c_score.alignment = Alignment(horizontal="center")
+        b = Side(style="thin", color="DDDDDD")
+        c_score.border    = Border(left=b, right=b, top=b, bottom=b)
+
+    # Formato condicional en Score Final
+    n = len(resultados) + 2
+    ws.conditional_formatting.add(f"F3:F{n}",
+        ColorScaleRule(start_type="num", start_value=0,  start_color="FFC7CE",
+                       mid_type="num",   mid_value=50,   mid_color="FFEB9C",
+                       end_type="num",   end_value=100,  end_color="C6EFCE"))
+    _aw(ws, 40)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  HOJA REFERENCIA (tabla de reglas y niveles)
+# ══════════════════════════════════════════════════════════════════
+
+def hoja_referencia(wb):
+    ws = wb.create_sheet("REFERENCIA")
+    ws.sheet_view.showGridLines = False
+
+    ws.merge_cells("A1:G1")
+    ws["A1"].value = "Tabla de Reglas de Evaluación — Abbott Automatizabilidad"
+    ws["A1"].font  = Font(bold=True, name="Arial", size=12, color="FFFFFF")
+    ws["A1"].fill  = PatternFill("solid", fgColor="1F4E79")
+    ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 28
+
+    for j, h in enumerate(["Cod","Regla","Peso","Nivel","Descripción del Nivel",
+                            "Bloqueo Duro","Techo si Bloqueo"], 1):
+        _hdr(ws.cell(2, j), "2E4057")
+        ws.cell(2, j).value = h
+    ws.row_dimensions[2].height = 20
+
+    fila = 3
+    alt  = False
+    for cod, cfg in REGLAS.items():
+        bg = "F2F2F2" if alt else "FFFFFF"
+        niveles_ordenados = sorted(cfg["niveles"].items())
+        for nivel, desc in niveles_ordenados:
+            _cel(ws.cell(fila, 1), cod,  bold=True, bg=bg, h="center")
+            _cel(ws.cell(fila, 2), cfg["descripcion"], bg=bg, h="left")
+            _cel(ws.cell(fila, 3), cfg["peso"], bg=bg, h="center")
+            _cel(ws.cell(fila, 4), nivel, bg=bg, h="center",
+                 color="C00000" if nivel == 10 else "000000",
+                 bold=(nivel == 10))
+            _cel(ws.cell(fila, 5), desc, bg=bg, h="left", wrap=True)
+            _cel(ws.cell(fila, 6), "SÍ" if cfg["bloqueo"] else "No",
+                 bg=bg, h="center",
+                 color="C00000" if cfg["bloqueo"] else "666666")
+            _cel(ws.cell(fila, 7),
+                 str(cfg["techo"]) if cfg["techo"] else "—",
+                 bg=bg, h="center")
+            ws.row_dimensions[fila].height = 18
+            fila += 1
+        alt = not alt
+
+    ws.column_dimensions["A"].width = 6
+    ws.column_dimensions["B"].width = 26
+    ws.column_dimensions["C"].width = 7
+    ws.column_dimensions["D"].width = 7
+    ws.column_dimensions["E"].width = 55
+    ws.column_dimensions["F"].width = 13
+    ws.column_dimensions["G"].width = 16
+
+
+# ══════════════════════════════════════════════════════════════════
+#  RESTO DE HOJAS
+# ══════════════════════════════════════════════════════════════════
+
+def hoja_resumen(wb, resultados):
+    ws = wb.create_sheet("RESUMEN")
+    ws.freeze_panes = "A3"
+    cols = ["Archivo","Grupo","Formato","Hoja","Hojas Total","Vacía",
+            "Fila Encabezado","Enc. en Fila 1","Num Columnas","Filas con Datos",
+            "Filas en Blanco","% Col. Limpias","Cols Tipo Mixto",
+            "Fórmulas","Fusionadas","Pivot","Table","Separador","Encoding","Columnas"]
+    for j, h in enumerate(cols, 1):
+        _hdr(ws.cell(1, j)); ws.cell(1, j).value = h
+    fila = 2
+    for r in resultados:
+        for h in r.get("hojas",[]):
+            vs = [r["archivo"],r["grupo"],r["formato"],h.get("nombre",""),
+                  r.get("num_hojas"),"Sí" if h.get("vacia") else "No",
+                  h.get("fila_encabezado"),"Sí" if h.get("encabezado_en_fila1") else "No",
+                  h.get("num_columnas"),h.get("filas_con_datos"),h.get("filas_en_blanco"),
+                  h.get("pct_columnas_limpias")," | ".join(h.get("columnas_mixtas",[])),
+                  r.get("total_formulas"),r.get("fusionadas"),
+                  "Sí" if r.get("tiene_pivot") else "No",
+                  "Sí" if r.get("tiene_table") else "No",
+                  r.get("separador","N/A"),r.get("encoding","N/A"),
+                  " | ".join(h.get("nombres_columnas",[]))[:500]]
+            for j, v in enumerate(vs, 1):
+                _cel(ws.cell(fila, j), v, h="left" if j in (1,2,20) else "center")
+            fila += 1
+    _aw(ws)
+
+def hoja_nulos(wb, resultados):
+    ws = wb.create_sheet("DETALLE_NULOS")
+    ws.freeze_panes = "A2"
+    for j,h in enumerate(["Archivo","Hoja","Columna","Tipo Dato","% Nulos"],1):
+        _hdr(ws.cell(1,j)); ws.cell(1,j).value = h
+    fila = 2
+    for r in resultados:
+        for h in r.get("hojas",[]):
+            for col, pct in h.get("pct_nulos",{}).items():
+                _cel(ws.cell(fila,1), r["archivo"])
+                _cel(ws.cell(fila,2), h.get("nombre",""))
+                _cel(ws.cell(fila,3), col, h="left")
+                _cel(ws.cell(fila,4), h.get("tipos",{}).get(col,"?"))
+                _cel(ws.cell(fila,5), pct)
+                fila += 1
+    _aw(ws)
+
+def hoja_adjuntos(wb, adjuntos):
+    ws = wb.create_sheet("ADJUNTOS_CORREOS")
+    ws.freeze_panes = "A2"
+    cols = ["Correo","Ruta Correo","Asunto","Remitente","Fecha Correo",
+            "Adjunto","Extensión","Tamaño KB","Es Dato"]
+    for j,h in enumerate(cols,1): _hdr(ws.cell(1,j)); ws.cell(1,j).value = h
+    for i, a in enumerate(adjuntos, 2):
+        for j, k in enumerate(["correo","ruta_correo","asunto","remitente",
+                                "fecha_correo","adjunto","extension",
+                                "tamanio_kb","es_dato"], 1):
+            _cel(ws.cell(i,j), a.get(k,""))
+    _aw(ws)
+
+def hoja_grupos(wb, grupos):
+    ws = wb.create_sheet("GRUPOS")
+    ws.freeze_panes = "A2"
+    for j,h in enumerate(["Grupo","Num Archivos","Evaluable (>1 archivo)","Archivos"],1):
+        _hdr(ws.cell(1,j)); ws.cell(1,j).value = h
+    for i, (g, rutas) in enumerate(sorted(grupos.items()), 2):
+        _cel(ws.cell(i,1), g)
+        _cel(ws.cell(i,2), len(rutas))
+        _cel(ws.cell(i,3), "Sí" if len(rutas) > 1 else "Archivo único — E estimado")
+        _cel(ws.cell(i,4), " | ".join(os.path.basename(p) for p in rutas[:15])
+                           + ("..." if len(rutas)>15 else ""), h="left")
+    _aw(ws)
+
+def hoja_errores(wb, errores):
+    ws = wb.create_sheet("ERRORES")
+    ws.freeze_panes = "A2"
+    for j,h in enumerate(["Archivo","Ruta","Formato","Error"],1):
+        _hdr(ws.cell(1,j),"C00000"); ws.cell(1,j).value = h
+    for i, e in enumerate(errores, 2):
+        for j,k in enumerate(["archivo","ruta","formato","error"],1):
+            _cel(ws.cell(i,j), e.get(k,""), h="left")
+    _aw(ws)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  EXPORTAR REPORTE COMPLETO
+# ══════════════════════════════════════════════════════════════════
+
+def exportar(resultados, adjuntos, grupos, errores, ruta_salida):
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+
+    # Forzar recálculo automático al abrir en Excel
+    wb.calculation.calcMode = "auto"
+
+    hoja_dashboard(wb, resultados)
+    hoja_scoring(wb, resultados)
+    hoja_resumen(wb, resultados)
+    hoja_nulos(wb, resultados)
+    hoja_adjuntos(wb, adjuntos)
+    hoja_grupos(wb, grupos)
+    hoja_referencia(wb)
+    hoja_errores(wb, errores)
+
+    wb.save(ruta_salida)
+    print(f"\n✅  Reporte guardado: {os.path.abspath(ruta_salida)}")
+
+
+# ══════════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════════
+
+def main():
+    if not os.path.isdir(CARPETA_RAIZ):
+        print(f"❌  Carpeta no encontrada: {CARPETA_RAIZ}")
+        sys.exit(1)
+
+    print(f"\n🔍  Escaneando: {os.path.abspath(CARPETA_RAIZ)}\n")
+    encontrados = descubrir_archivos(CARPETA_RAIZ)
+
+    directos = [f for f in encontrados if f["tipo"] == "datos"]
+    correos  = [f for f in encontrados if f["tipo"] == "correo"]
+    print(f"   Archivos de datos : {len(directos)}")
+    print(f"   Correos .msg      : {len(correos)}\n")
+
+    # Inferir grupos y construir índice
+    grupos_rutas = defaultdict(list)   # grupo → [rutas]
+    for item in directos:
+        g = inferir_grupo(item["ruta"], item["subcarpeta"])
+        item["grupo"] = g
+        grupos_rutas[g].append(item["ruta"])
+
+    resultados, adjuntos_all, errores = [], [], []
+    total = len(directos) + len(correos)
+
+    # ── Archivos directos ─────────────────────────────────────────
+    for i, item in enumerate(directos, 1):
+        nombre = os.path.basename(item["ruta"])
+        print(f"  [{i:>4}/{total}] {nombre[:65]:<65}", end=" ", flush=True)
+        ctx = grupos_rutas.get(item["grupo"], [])
+        r   = analizar_archivo(item, ctx_grupo=ctx)
+
+        if r["error_lectura"] and not r["hojas"]:
+            errores.append({"archivo":nombre,"ruta":item["ruta"],
+                            "formato":r.get("formato","?"),"error":r["error_lectura"]})
+            print(f"❌  {r['error_lectura'][:55]}")
+        else:
+            msg = f"✔   {r['num_hojas']} hoja(s)"
+            if r["error_lectura"]: msg += f"  ⚠️ {r['error_lectura'][:30]}"
+            if r["tiene_pwd"]:     msg += "  🔒 contraseña"
+            print(msg)
+            resultados.append(r)
+
+    # ── Correos .msg ──────────────────────────────────────────────
+    for i, item in enumerate(correos, len(directos)+1):
+        nombre = os.path.basename(item["ruta"])
+        print(f"  [{i:>4}/{total}] 📧 {nombre[:62]:<62}", end=" ", flush=True)
+
+        adj_info, datos_ext, err_msg = extraer_adjuntos_msg(item["ruta"])
+        if err_msg and not adj_info:
+            errores.append({"archivo":nombre,"ruta":item["ruta"],
+                            "formato":"msg","error":err_msg})
+            print(f"❌  {err_msg[:55]}")
+            continue
+
+        adjuntos_all.extend(adj_info)
+        print(f"✔   {len(adj_info)} adjuntos ({sum(1 for a in adj_info if a['es_dato'])} datos)")
+
+        for nombre_adj, ext_adj, bytes_adj, asunto, remit, fecha in datos_ext:
+            print(f"         ↳ {nombre_adj[:60]:<60}", end=" ", flush=True)
+            sub_item = {"ruta":None, "nombre_display":nombre_adj, "bytes":bytes_adj,
+                        "subcarpeta":item["subcarpeta"], "correo_padre":nombre,
+                        "asunto_correo":asunto, "remitente":remit, "fecha_correo":fecha,
+                        "grupo":inferir_grupo(nombre_adj, item["subcarpeta"])}
+            r = analizar_archivo(sub_item)
+            if r["error_lectura"] and not r["hojas"]:
+                errores.append({"archivo":nombre_adj,"ruta":f"(en {nombre})",
+                                "formato":ext_adj,"error":r["error_lectura"]})
+                print(f"❌  {r['error_lectura'][:45]}")
+            else:
+                print(f"✔   {r['num_hojas']} hoja(s)")
+                resultados.append(r)
+
+    # ── Recalcular regla E por grupo ──────────────────────────────
+    grupos_rs = defaultdict(list)
+    for r in resultados: grupos_rs[r["grupo"]].append(r)
+    recalcular_E_por_grupo(grupos_rs)
+
+    # ── Exportar ──────────────────────────────────────────────────
+    print(f"\n📊  Generando reporte ({len(resultados)} archivos)...")
+    exportar(resultados, adjuntos_all, grupos_rutas, errores, ARCHIVO_SALIDA)
+
+    # Resumen final en consola
+    cats = defaultdict(int)
+    scores = []
+    for r in resultados:
+        _, s, c, _ = calcular_score(r.get("niveles",{}))
+        scores.append(s); cats[c] += 1
+
+    print(f"\n{'─'*58}")
+    print(f"  Archivos analizados  : {len(resultados)}")
+    print(f"  Archivos con error   : {len(errores)}")
+    if scores:
+        print(f"  Score promedio       : {round(sum(scores)/len(scores),1)}")
+        print(f"  Score máximo         : {max(scores)}")
+        print(f"  Score mínimo         : {min(scores)}")
+    print()
+    for cat in COLORES_CAT:
+        if cats[cat]:
+            print(f"  {cat:<42}: {cats[cat]}")
+    print(f"{'─'*58}\n")
+
+
+if __name__ == "__main__":
+    main()
