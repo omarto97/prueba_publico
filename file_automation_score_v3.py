@@ -180,32 +180,41 @@ def es_nombre_columna_limpio(nombre):
 
 def _contar_formulas_fusiones_xlsx(src):
     """
-    Abre el workbook XLSX UNA SOLA VEZ y cuenta fórmulas + celdas fusionadas.
-    Usa read_only=True para fórmulas (más rápido); luego una pasada extra
-    read_only=False solo para fusiones (openpyxl las expone solo ahí).
-    """
-    n_formulas, n_fusiones = 0, 0
-    try:
-        # Fórmulas: read_only=True es mucho más rápido en archivos grandes
-        wb = openpyxl.load_workbook(src, read_only=True, data_only=False)
-        for ws in wb.worksheets:
-            for row in ws.iter_rows():
-                for cell in row:
-                    if cell.data_type == "f" or (
-                        isinstance(cell.value, str) and cell.value.startswith("=")
-                    ):
-                        n_formulas += 1
-        wb.close()
+    Lee el XML interno del ZIP (que es un XLSX) directamente con zipfile + re.
+    Evita por completo cargar openpyxl para esta operación, lo que en archivos
+    grandes era el principal cuello de botella (minutos → milisegundos).
 
-        # Fusiones: necesita read_only=False, pero solo accede a merged_cells (metadata)
-        # En archivos muy grandes esto sigue siendo rápido porque no itera celdas
-        src2 = io.BytesIO(src.getvalue()) if isinstance(src, io.BytesIO) else src
-        wb2  = openpyxl.load_workbook(src2, read_only=False, data_only=True)
-        for ws in wb2.worksheets:
-            n_fusiones += len(ws.merged_cells.ranges)
-        wb2.close()
+    Busca:
+      • Fórmulas : atributo  t="str"  o  t="inlineStr" ya lo maneja pandas;
+                   lo que nos interesa es la etiqueta <f> dentro de <c>.
+      • Fusiones : etiqueta <mergeCell ref="..."/> en sheetX.xml
+    """
+    import zipfile
+
+    n_formulas, n_fusiones = 0, 0
+
+    # Aseguramos tener bytes, no un path
+    if isinstance(src, str):
+        raw = open(src, "rb").read()
+    elif isinstance(src, io.BytesIO):
+        raw = src.getvalue()
+    else:
+        raw = src.read()
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            nombres = zf.namelist()
+            hojas   = [n for n in nombres if re.match(r"xl/worksheets/sheet\d+\.xml", n)]
+
+            for hoja in hojas:
+                xml = zf.read(hoja)
+                # Contar etiquetas <f ...> o <f> (fórmulas)
+                n_formulas += len(re.findall(rb"<f[ >/]", xml))
+                # Contar etiquetas <mergeCell (fusiones)
+                n_fusiones += len(re.findall(rb"<mergeCell ", xml))
     except Exception:
         pass
+
     return n_formulas, n_fusiones
 
 
@@ -590,6 +599,8 @@ def main():
         for fut in as_completed(futures_map):
             idx, nombre = futures_map[fut]
             completados += 1
+            # Imprime el nombre ANTES del resultado para que nunca haya silencio en consola
+            print(f"  [{completados:>4}/{total_estimado}] {nombre[:60]:<60}", end=" ", flush=True)
             try:
                 r = fut.result()
                 resultados[idx] = r
@@ -603,7 +614,7 @@ def main():
                     "origen": "directo", "correo_padre": None,
                 }
                 estado = f"❌ {str(exc)[:40]}"
-            print(f"  [{completados:>4}/{total_estimado}] {nombre[:60]:<60} {estado}")
+            print(estado)
 
     # ── Correos .msg (secuencial, extract-msg no es thread-safe) ──────────
     for i, item in enumerate(correos):
