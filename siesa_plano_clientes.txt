@@ -1,0 +1,1217 @@
+"set nocount on
+
+-- 1.actualiza  información complemento
+update	t_tabla 
+set		f_complemento = dbo.lpad(isnull(f200_rowid,0),10,'0') 
+from	t_tabla  
+		left outer join t200_mm_terceros on convert(smallint,substring(f_registro,16,3)) = f200_id_cia 
+								and rtrim(substring(f_registro,20,15)) = rtrim(f200_id) -- id tercero
+where 	f_tipo_reg = 201
+and	  	f_subtipo_reg = 0
+and   	f_version = 15
+
+--  1.1. Actualiza complemento(rowid_contacto e indicador de si existe sucursal o no)
+update	t_tabla 
+set		f_complemento = rtrim(f_complemento) + dbo.lpad(isnull(f201_rowid_contacto,0),10,'0') 
+						+ case when f201_rowid_tercero is null then '0' else '1' end
+from   	t_tabla  
+		left outer join t201_mm_clientes on convert(int,substring(f_complemento,1,10)) = f201_rowid_tercero
+						and rtrim(substring(f_registro,35,3)) = f201_id_sucursal
+where 	f_tipo_reg = 201
+and	  	f_subtipo_reg = 0
+and   	f_version = 15
+
+-- 1.2. Actualiza la informacion del rowid tercero corporativo
+update	t_tabla
+set		f_complemento = rtrim(f_complemento) + dbo.lpad(isnull(f200_rowid,0),10,'0')
+from	t_tabla
+		left outer join t200_mm_terceros on convert(smallint,substring(f_registro,1114,3)) = f200_id_cia --id cia tercero complementario
+						and rtrim(substring(f_registro,114,15)) = rtrim(f200_id) -- id tercero complementario
+where 	f_tipo_reg = 201
+and	  	f_subtipo_reg = 0
+and   	f_version = 15
+
+--  1.3. Actualiza complemento(rowid entidad dinamica)
+update	t_tabla 
+set		f_complemento = rtrim(f_complemento) + dbo.lpad(isnull(f201_rowid_movto_entidad,0),10,'0')
+from   	t_tabla  
+		left outer join t201_mm_clientes on convert(int,substring(f_complemento,1,10)) = f201_rowid_tercero
+						and rtrim(substring(f_registro,35,3)) = f201_id_sucursal
+where 	f_tipo_reg = 201
+and	  	f_subtipo_reg = 0
+and   	f_version = 15
+
+-- 2. Valida si el tercero existe
+insert into t665_imp_log_detalle(
+				f665_rowid_imp_log,
+				f665_tipo_reg,
+				f665_subtipo_reg,
+				f665_version,
+				f665_nro_registro,
+				f665_valor_error, 
+				f665_detalle_error, 
+				f665_ind_transaccion
+				)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,20,15),
+		'Clientes: El tercero no existe.',
+		0
+from	t_tabla
+where	convert(int,substring(f_complemento,1,10)) = 0
+and	  	f_tipo_reg = 201
+and	  	f_subtipo_reg = 0
+and   	f_version = 15
+
+-- 3. Valida moneda
+insert into t665_imp_log_detalle(
+				f665_rowid_imp_log,
+				f665_tipo_reg,
+				f665_subtipo_reg,
+				f665_version,
+				f665_nro_registro,
+				f665_valor_error, 
+				f665_detalle_error, 
+				f665_ind_transaccion
+				)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,79,3),
+		'Clientes: La moneda no existe.',0
+from	t_tabla
+where	not exists(select 'x' 
+		from t017_mm_monedas
+		where  f017_id_cia = f_cia
+		and    f017_id = substring(f_registro,79,3))
+and		f_tipo_reg = 201
+and	  	f_subtipo_reg = 0
+and   	f_version = 15
+
+-- 4. Valida condicion de pago si viene
+insert into t665_imp_log_detalle(
+				f665_rowid_imp_log,
+				f665_tipo_reg,
+				f665_subtipo_reg,
+				f665_version,
+				f665_nro_registro,
+				f665_valor_error, 
+				f665_detalle_error, 
+				f665_ind_transaccion
+				)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,87,3),
+		'Clientes: La condición de pago no existe.',
+		0
+from	t_tabla
+where	not exists(select 'x' 
+		from	t208_mm_condiciones_pago
+		where	f208_id_cia = f_cia
+		and	f208_id = substring(f_registro,87,3))
+and		substring(f_registro,87,3) <> ''
+and		f_tipo_reg = 201
+and	  	f_subtipo_reg = 0
+and   	f_version = 15
+
+-- 5. Valida tipo cliente
+insert into t665_imp_log_detalle(
+				f665_rowid_imp_log,
+				f665_tipo_reg,
+				f665_subtipo_reg,
+				f665_version,
+				f665_nro_registro,	
+				f665_valor_error, 
+				f665_detalle_error, 
+				f665_ind_transaccion
+				)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,132,4),
+		'Clientes: El tipo cliente no existe.',
+		0
+from	t_tabla
+where	not exists(select 'x' 
+		from	t278_co_tipo_cli
+		where	f278_id_cia = f_cia
+		and	f278_id = substring(f_registro,132,4))
+and		f_tipo_reg = 201
+and	  	f_subtipo_reg = 0
+and   	f_version = 15
+
+-- 6. Valida si el pais existe
+insert into t665_imp_log_detalle(
+				f665_rowid_imp_log,
+				f665_tipo_reg,
+				f665_subtipo_reg,
+				f665_version,
+				f665_nro_registro,
+				f665_valor_error, 
+				f665_detalle_error, 
+				f665_ind_transaccion
+				)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,597,3),
+		'Clientes: El pais no existe.',0
+from	t_tabla
+where	not exists(	select 'x' 
+					from t011_mm_paises
+					where  f011_id = substring(f_registro,597,3)
+					)
+and		f_tipo_reg = 201
+and	  	f_subtipo_reg = 0
+and   	f_version = 15
+and		rtrim(substring(f_registro,597,3)) <> ''
+
+-- 7. Valida si el depto existe
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error, 
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,600,2),
+		'Clientes: El departamento no existe.',
+		0
+from	t_tabla
+where	not exists(select 'x' 
+					from	t012_mm_deptos
+					where	f012_id_pais = substring(f_registro,597,3)
+					and	f012_id = substring(f_registro,600,2))
+and		f_tipo_reg = 201
+and		f_subtipo_reg = 0
+and   	f_version = 15
+and		(rtrim(substring(f_registro,597,3)) <> '' or rtrim(substring(f_registro,600,2)) <> '')
+
+-- 8. Valida si la ciudad existe
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error, 
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg,
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,602,3),
+		'Clientes: La ciudad no existe.',
+		0
+from	t_tabla
+where	not exists(	select 'x' 
+					from t013_mm_ciudades
+					where  f013_id_pais = substring(f_registro,597,3)
+					and   f013_id_depto = substring(f_registro,600,2)
+					and   f013_id = substring(f_registro,602,3)
+					)
+and		f_tipo_reg = 201
+and		f_subtipo_reg = 0
+and   	f_version = 15
+and		(rtrim(substring(f_registro,597,3)) <> '' or rtrim(substring(f_registro,600,2)) <> '' or rtrim(substring(f_registro,602,3)) <> '' )
+
+-- 9. Valida si el vendedor existe
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error, 
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,82,4),
+		'Clientes: el vendedor no existe.',
+		0
+from	t_tabla
+where	not exists(	select 'x' 
+					from	t210_mm_vendedores
+					where	f210_id_cia = f_cia
+					and	f210_id = substring(f_registro,82,4))
+and		f_tipo_reg = 201
+and    	f_subtipo_reg = 0
+and    	f_version = 12
+and		rtrim(substring(f_registro,82,4)) <> '' -- vendedor
+
+-- 10. Valida si lista de precios existe
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error, 
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,140,3),
+		'Clientes: la lista de precios no existe o no maneja la moneda del cliente',
+		0
+from	t_tabla
+where	not exists(	select 'x' 
+					from	t112_mc_listas_precios
+					where	f112_id_cia = f_cia
+					and	f112_id = substring(f_registro,140,3) -- id lista de precio
+					and	f112_id_moneda = substring(f_registro,79,3)) -- id moneda
+and		f_tipo_reg = 201
+and		f_subtipo_reg = 0
+and		f_version = 15
+and		rtrim(substring(f_registro,140,3)) <> '' -- lista de precio
+
+-- 11. Valida si el grupo de descuento existe
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error, 
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 	
+		f_numero_reg, 
+		substring(f_registro,136,4),
+		'Clientes: el grupo de descuento no existe.',
+		0
+from	t_tabla
+where	not exists(	select 'x' 
+					from	t109_mc_grupo_dscto
+					where	f109_id_cia = f_cia
+					and	f109_id = substring(f_registro,136,4)) -- id grupo dscto
+and		f_tipo_reg = 201
+and	  	f_subtipo_reg = 0
+and   	f_version = 15
+and		rtrim(substring(f_registro,136,4)) <> '' -- id grupo dscto
+
+-- 12. Valida el CO de la factura
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error,
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,169,3),
+		'Clientes: el C.O. de la factura no existe.',
+		0
+from	t_tabla
+where	not exists(	select 'x' 
+					from	t285_co_centro_op
+					where	f285_id_cia = f_cia
+					and	f285_id = substring(f_registro,169,3)) -- Co factura
+and		f_tipo_reg = 201
+and		f_subtipo_reg = 0
+and   	f_version = 15
+and		rtrim(substring(f_registro,169,3)) <> '' -- id CO factura
+
+-- 13. Valida que el indicador de estado sea 1
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error, 
+			f665_ind_transaccion
+			)
+select	@p_rowid_log,
+		f_tipo_reg,
+		f_subtipo_reg,
+		f_version,
+		f_numero_reg,
+		substring(f_registro,38,1),
+		'Clientes: el estado debe ser 0 ó 1.',
+		0
+from	t_tabla
+where	f_tipo_reg = 201
+and	  	f_subtipo_reg = 0
+and   	f_version = 15
+and		not convert(smallint,substring(f_registro,38,1)) in (0,1) -- ind estado
+
+-- 14. Valida que los dias de gracia esten entre 0 y 365
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error, 
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,90,3),
+		'Clientes: los días de gracia deben estar entre 0 y 365.',
+		0
+from	t_tabla
+where	f_tipo_reg = 201
+and	  	f_subtipo_reg = 0
+and   	f_version = 15
+and		not convert(smallint,substring(f_registro,90,3)) between 0 and 365 -- dias gracia
+
+-- 15. Valida que la calificacion sea A,B o C
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error, 
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,86,1),
+		'Clientes: la calificación debe ser A, B ó C.',
+		0
+from	t_tabla
+where	f_tipo_reg = 201
+and	  	f_subtipo_reg = 0
+and   	f_version = 15
+and		substring(f_registro,86,1) not in ('A','B','C')
+
+-- 16. Valida que el indicador de backorder este entre 0 a 6
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error, 
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,143,1),
+		'Clientes: el indicador de backorder debe ser 0,1,2,3,4,5 o 6.',
+		0
+from	t_tabla
+where	f_tipo_reg = 201
+and	  	f_subtipo_reg = 0
+and   	f_version = 15
+and		substring(f_registro,143,1) not in ('0','1','2','3','4','5','6')
+
+-- 17. Valida que el porcentaje exceso en la cantidad pedida a despachar no sea negativo
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error, 
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		rtrim(substring(f_registro,20,15)) + ' - ' + substring(f_registro,35,3),
+		'Clientes: el porcentaje de exceso de venta en cantidad pedida a despachar no puede ser negativo.',
+		0
+from	t_tabla
+where	f_tipo_reg = 201
+and	  	f_subtipo_reg = 0
+and   	f_version = 15
+and		(convert(decimal(28,2),substring(f_registro,144,7)) < 0)
+
+-- 18. Valida que los indicadores de bloqueo cupo, mora, factura unificada sean 0 o 1
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error, 
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		rtrim(substring(f_registro,20,15)) + ' - ' + substring(f_registro,35,3),
+		'Clientes: los indicadores de bloqueo cupo, bloqueo mora y factura unificada deben ser 0 ó 1.',
+		0
+from	t_tabla
+where	f_tipo_reg = 201
+and	  	f_subtipo_reg = 0
+and   	f_version = 15
+and		(substring(f_registro,166,1) not in ('0','1')
+		or substring(f_registro,167,1) not in ('0','1')
+		or substring(f_registro,168,1) not in ('0','1')
+		)
+
+-- 19. Valida que el tipo de cliente maneje la misma moneda del cliente
+insert into t665_imp_log_detalle(	
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error, 
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,132,4),
+		'Clientes: El tipo cliente debe manejar la moneda local o la moneda del cliente.',
+		0
+from	t_tabla
+where	not exists(	select	'x' 
+					from	t278_co_tipo_cli
+							inner	join t253_co_auxiliares	on f278_rowid_aux_cxc = f253_rowid
+							inner	join t010_mm_companias	on f278_id_cia = f010_id
+					where	f278_id_cia = f_cia
+					and		f278_id = substring(f_registro,132,4)
+					and		(f253_id_moneda = substring(f_registro,79,3)
+							or  f253_id_moneda = f010_id_moneda_local)
+				)
+and		f_tipo_reg = 201
+and	  	f_subtipo_reg = 0
+and   	f_version = 15
+
+-- 20. Valida que el cupo de credito no sea mayor a 
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error, 
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,93,21),
+		'Clientes: el valor del cupo de credito debe ser mayor o igual a 0 y menor a 99,999,999,999.9999',
+		0
+from	t_tabla
+where	(dbo.f_convert(substring(f_registro,93,21)) > 99999999999.9999 or dbo.f_convert(substring(f_registro,93,21)) < 0)
+and		f_tipo_reg = 201
+and	  	f_subtipo_reg = 0
+and   	f_version = 15
+
+-- 21. Validacion del tercero corporativo
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error, 
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,114,15),
+		'Clientes: El tercero corporativo no existe.',
+		0
+from	t_tabla
+where	convert(int,substring(f_complemento,22,10)) = 0
+and    	convert(smallint, substring(f_registro,1114,3)) > 0 --no fue enviada como cero
+and		rtrim(substring(f_registro,114,15))  <> ''
+and		f_tipo_reg = 201
+and	  	f_subtipo_reg = 0
+and   	f_version = 15
+
+-- 22. Validacion del tercero corporativo
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error, 
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,129,3),
+		'Clientes: Debe venir tercero corporativo.',
+		0
+from	t_tabla
+where	rtrim(substring(f_registro,114,15))  = ''
+and		rtrim(substring(f_registro,129,3)) <> ''
+and		f_tipo_reg = 201
+and	  	f_subtipo_reg = 0
+and   	f_version = 15
+
+-- 23. Valida que el tercero al que se le asigna el corporativo no sea corporativo de otro
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error, 
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,20,15),
+		'Clientes: El cliente no puede tener cliente corporativo porque es corporativo de otro.',
+		0
+from	t_tabla 
+where  exists ( select 'x'
+				from	 t201_mm_clientes 	
+				where  f201_rowid_tercero_corp = convert(int,substring(f_complemento,1,10))
+				and 	 f201_id_sucursal_corp = substring(f_registro,35,3)
+				)
+and 	rtrim(substring(f_registro,114,15)) <> ''
+and 	rtrim(substring(f_registro,129,3)) <> ''
+and		f_tipo_reg = 201
+and	  	f_subtipo_reg = 0
+and   	f_version = 15
+
+-- 24. Valida que el tercero que se esta asignando no tenga asignado un tercero corporativo
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error, 
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,114,15),
+		'Clientes: El cliente corporativo que se esta asignando tiene cliente corporativo.',
+		0
+from	t_tabla 
+where 	exists(	select  'x'
+				from	t201_mm_clientes 	
+				where	f201_rowid_tercero = convert(int,substring(f_complemento,22,10))
+				and 	f201_id_sucursal = substring(f_registro,129,3)
+				and 	not f201_rowid_tercero_corp is null
+				and 	not f201_id_sucursal_corp is null)
+and		f_tipo_reg = 201
+and	  	f_subtipo_reg = 0
+and   	f_version = 15
+
+-- 25. Validar que el indicador de bloqueado sea 0 ó 1
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error, 
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,165,1),
+		'Clientes: el indicador de bloqueo deben ser 0 ó 1.',
+		0
+from	t_tabla
+where	f_tipo_reg = 201
+and	  	f_subtipo_reg = 0
+and   	f_version = 15
+and		substring(f_registro,165,1) not in ('0','1')
+
+-- 26. Validar que el cliente no sea igual al cliente
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error, 
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,20,15) + '-' + substring(f_registro,35,3),
+		'Clientes: El cliente corporativo debe ser diferente al cliente que se esta importando.',
+		0
+from	t_tabla 
+where 	f_tipo_reg = 201
+and	  	f_subtipo_reg = 0
+and   	f_version = 15
+and		rtrim(substring(f_registro,20,15)) = rtrim(substring(f_registro,114,15))
+and		rtrim(substring(f_registro,35,3)) = rtrim(substring(f_registro,129,3))
+
+--27. Validar que al cliente que se le asigna cliente corporativo no tega cupo
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error, 
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,93,21),
+		'Clientes: El cupo debe ser cero si tiene cliente corporativo.',
+		0
+from	t_tabla 
+where 	f_tipo_reg = 201
+and	  	f_subtipo_reg = 0
+and   	f_version = 15
+and 	convert(money,substring(f_registro,93,21)) <> 0
+and		rtrim(substring(f_registro,114,15)) <> ''
+
+--28. Validar que el cliente corporativo no este inactivo
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error, 
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,114,15),
+		'Clientes: El cliente corporativo no puede estar inactivo.',
+		0
+from	t_tabla 
+where 	f_tipo_reg = 201
+and	  	f_subtipo_reg = 0
+and   	f_version = 15
+and		exists(	select 'x'
+				from t201_mm_clientes
+				where	f201_rowid_tercero = convert(int,substring(f_complemento,22,10))
+				and 	f201_id_sucursal = substring(f_registro,129,3)
+				and	f201_ind_estado_activo = 0)
+
+--29. Valida el CO de movto factura
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error,
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,958,3),
+		'Clientes: el C.O. Movto. de la factura no existe.',
+		0
+from	t_tabla
+where	not exists(	select 'x' 
+					from t285_co_centro_op
+					where f285_id_cia = f_cia
+					and	f285_id = substring(f_registro,958,3)) -- Co movto factura
+and		f_tipo_reg = 201
+and	  	f_subtipo_reg = 0
+and   	f_version = 15
+and		rtrim(substring(f_registro,958,3)) <> ''
+
+--30. Valida el CO de movto factura
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error,
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,961,2),
+		'Clientes: la U.N. Movto. de la factura no existe.',
+		0
+from	t_tabla
+where	not exists(select 'x' 
+					from t281_co_unidades_negocio
+					where f281_id_cia = f_cia
+					and	f281_id = ltrim(rtrim(substring(f_registro,961,20)))) --Un movto factura
+and		f_tipo_reg = 201
+and	  	f_subtipo_reg = 0
+and   	f_version = 15
+and		rtrim(substring(f_registro,961,20)) <> ''
+
+--31. Valida el codigo del parametro EDI
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error,
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,981,4),
+		'Clientes: El código del parametro EDI no existe.',
+		0
+from	t_tabla
+where	not exists(	select	1 
+					from 	t180_parametros_edi
+					where 	f180_id_cia = f_cia
+					and 	f180_id = substring(f_registro,981,4)) --Parametro EDI
+and		f_tipo_reg = 201
+and	  	f_subtipo_reg = 0
+and   	f_version = 15
+and		rtrim(substring(f_registro,981,4)) <> ''
+
+--32. Valida que la fecha vigencia cupo sea valida si viene
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error,
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,1020,8),
+		'Clientes: La fecha de vigencia del cupo no es valida.',
+		0
+from	t_tabla
+where	isdate(substring(f_registro,1020,8)) = 0
+and		f_tipo_reg = 201
+and    	f_subtipo_reg = 0
+and    	f_version = 12
+and		substring(f_registro,1020,8) <> ''
+
+-- 33. Valida que el porcentaje de tolerancia este entre 0 y 100
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error, 
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		rtrim(substring(f_registro,1028,7)),
+		'Clientes: el porcentaje de tolerancia deber estar entre 0 y 100.',
+		0
+from	t_tabla
+where	f_tipo_reg = 201
+and		f_subtipo_reg = 0
+and		f_version = 12
+and		not convert(decimal(28,2),substring(f_registro,1028,7)) between 0 and 100 -- porcentaje de tolerancia
+
+--34. Valido que el día máximo de facturación este entre 0 y 31
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error,
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,1035,2),
+		'Clientes: El día máximo de facturación debe estar entre 0 y 31.',
+		0
+from 	t_tabla
+where 	(convert(smallint, substring(f_registro,1035,2)) < 0 or convert(smallint, substring(f_registro,1035,2)) > 31)
+and 	f_tipo_reg = 201
+and 	f_subtipo_reg = 0
+and 	f_version = 12   
+
+--35. Valida el motivo de bloqueo
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error,
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,1037,3),
+		'Clientes: El motivo de bloqueo no existe.',
+		0
+from	t_tabla
+where	not exists(	select 'x' 
+					from t229_mm_motivos_bloqueo
+					where f229_id_cia = f_cia
+					and	f229_id = substring(f_registro,1037,3)) -- Motivo de bloqueo
+and   	f_tipo_reg = 201
+and	  	f_subtipo_reg = 0
+and   	f_version = 15
+and	  	rtrim(substring(f_registro,1037,3)) <> ''
+
+-- 36. Valida si el cobrador existe
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error, 
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,1040,4),
+		'Clientes: el cobrador no existe.',
+		0
+from	t_tabla
+where	not exists(	select 'x' 
+					from	t210_mm_vendedores
+					where	f210_id_cia = f_cia
+					and f210_ind_cobrador = 1
+					and	f210_id = substring(f_registro,1040,4))
+and		f_tipo_reg = 201
+and    	f_subtipo_reg = 0
+and    	f_version = 12
+and		rtrim(substring(f_registro,1040,4)) <> '' -- Cobrador
+
+-- 37. Validar que el indicador para compromiso con unidad de empaque principal sea 0 ó 1
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error, 
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,1044,1),
+		'Clientes: Indicador para compromiso con unidad de empaque principal debe ser 0 ó 1.',
+		0
+from	t_tabla
+where	f_tipo_reg = 201
+and		f_subtipo_reg = 0
+and		f_version = 12
+and		substring(f_registro,1044,1) not in ('0','1')
+
+-- 38. Validar que el indicador de evalua anticipo tercero corporativo sea 0 ó 1
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error, 
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,1045,1),
+		'Clientes: El indicador para evaluar anticipos del tercero corporativo debe ser 0 ó 1.',
+		0
+from	t_tabla
+where	f_tipo_reg = 201
+and		f_subtipo_reg = 0
+and		f_version = 12
+and		substring(f_registro,1045,1) not in ('0','1')
+
+-- 39. Validar que el indicador de evalua anticipo tercero corporativo sea 0 ó 1
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error, 
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,1045,1),
+		'Clientes: El indicador para evaluar anticipos del tercero corporativo debe ser 0 si no se envía el cliente corporativo.',
+		0
+from	t_tabla
+where	f_tipo_reg = 201
+and		f_subtipo_reg = 0
+and		f_version = 12
+and		substring(f_registro,1045,1) = ('1')
+and		substring(f_registro,129,3) = ''
+
+-- 40. Validar que el indicador de de cupo despacho sea 0 ó 1
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error, 
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,1096,1),
+		'Clientes: El indicador para validar cupo despacho debe ser 0 ó 1.',
+		0
+from	t_tabla
+where	f_tipo_reg = 201
+and		f_subtipo_reg = 0
+and		f_version = 12
+and		substring(f_registro,1096,1) not in ('0','1')
+
+-- 41. Validar que el portafolio EDI exista si viene en el plano
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error, 
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,1097,10),
+		'Clientes: El portafolio EDI no existe o no es valido.',
+		0
+from	t_tabla
+where	f_tipo_reg = 201
+and		f_subtipo_reg = 0
+and		f_version = 12
+and		substring(f_registro,1097,10) <> ' '
+and 	not exists(	select 'x' 
+					from   t136_mc_portafolio
+					where  f136_id_cia = f_cia
+					and    f136_id = substring(f_registro,1097,10)) 
+
+
+-- 42. Validar que si viene la frecuencia entrega solo maneje 0 y 1
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error, 
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,1107,7),
+		'Clientes: La frecuencia entrega no es valida, solo permite valores de 0 y 1.',
+		0
+from	t_tabla
+where	f_tipo_reg = 201
+and		f_subtipo_reg = 0
+and		f_version = 15
+and 	(substring(f_registro,1107,1) not in ('0','1') 
+			or 	substring(f_registro,1108,1) not in ('0','1') 
+			or 	substring(f_registro,1109,1) not in ('0','1') 
+			or 	substring(f_registro,1110,1) not in ('0','1') 
+			or 	substring(f_registro,1111,1) not in ('0','1') 
+			or 	substring(f_registro,1112,1) not in ('0','1') 
+			or 	substring(f_registro,1113,1) not in ('0','1'))
+
+-- 43. La cia corporativa no existe
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error, 
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f_registro,114,15),
+		'Clientes: La compañia del cliente corporativo no existe.',
+		0
+from	t_tabla
+where	f_tipo_reg = 201
+and		f_subtipo_reg = 0
+and		f_version = 15
+and    	convert(smallint, substring(f_registro,1114,3)) > 0 --la cia no fue enviada como cero
+and 	not exists(	select 1 
+					from t010_mm_companias
+					where f010_id = convert(smallint, SUBSTRING(f_registro, 1114, 3)))
+
+-- 44. Validar que el cliente pertenezca a la cia enviada
+insert into t665_imp_log_detalle(
+			f665_rowid_imp_log,
+			f665_tipo_reg,
+			f665_subtipo_reg,
+			f665_version,
+			f665_nro_registro,
+			f665_valor_error, 
+			f665_detalle_error, 
+			f665_ind_transaccion
+			)
+select	@p_rowid_log, 
+		f_tipo_reg,
+		f_subtipo_reg, 
+		f_version, 
+		f_numero_reg, 
+		substring(f"
