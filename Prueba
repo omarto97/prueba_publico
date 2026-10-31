@@ -1,1 +1,97 @@
-https://registro.pse.com.co/PSENF/index.html?enc=62Z9Ioq5GQgIzZsS%2f9%2fTwiLwod88p5plbc%2bj%2fz5Y5mY%3d
+1. Filter values by column [Producto Desc.] <> blank 
+2. Add a hardcoded column for column [Instoreview-Cliente] = "Cruz Verde"
+3. Add a hardcoded column for column [Dem-Cliente] = "SOCOFAR - Distribuidora"
+4. Obtain Abbott Product Code from IMS master extraction from API Instoreview to add column [Product]
+
+Composite Key
+Source Table = Raw file Socofar
+Lookup Table = API product master extraction
+Result table = Socofar Step 4
+
+Source Table          	Lookup Table
+----------------------  -------------------
+[Instoreview-Cliente]	-> [Cadena]
+[COD FEMSA]       	-> [Codigo Producto Cadena]
+
+Returned columns		Name Column Objective
+[Codigo Producto Interno]	[Product]
+
+5. Obtain unified group description for products from Product Master to add column [STANDARD DESCRIPTION]
+
+Composite Key
+Source Table = Socofar Step 4
+Lookup Table = Product Master
+Result table = Socofar Step 5 
+
+Source Table          	Lookup Table
+----------------------  -------------------
+[Product]		-> [SAP CODE]
+
+Returned columns		Name Column Objective
+[STANDARD DESCRIPTION]		[STANDARD DESCRIPTION]
+
+6. Add the column [Unit Qty SKU] with the same value of column [Unidades]
+Result table = Socofar Step 6
+
+Alternative 1
+
+7. Filter product master based on [STANDARD DESCRIPTION] and obtain first [SAP CODE] with [VIGENCIA] = "SI" if description has no any code returned by condition, obtain first code for [STANDARD DESCRIPTION]
+Source Table = Product Master
+Result table = Product Master Applicable 
+
+8. Add product sap code valid from Product Master Applicable based on [STANDARD DESCRIPTION]
+Composite Key
+Source Table = Socofar Step 6
+Lookup Table = Product Master Applicable
+Result table = Socofar Step 8
+
+Source Table          		Lookup Table
+----------------------  	-------------------
+[STANDARD DESCRIPTION]		-> [STANDARD DESCRIPTION]
+
+Returned columns		Name Column Objective
+[SAP CODE]			[SAP CODE GROUP]
+
+9. Add column to ASP based on [STANDARD DESCRIPTION] from product master applicable.
+Composite Key
+Source Table = ASP
+Lookup Table = Product Master Applicable
+Result table = ASP Step 9
+
+Source Table          		Lookup Table
+----------------------  	-------------------
+[STANDARD DESCRIPTION]		-> [STANDARD DESCRIPTION]
+
+Returned columns		Name Column Objective
+[SAP CODE]			[SAP CODE GROUP]
+
+10. Obtain ASP from ASP intere file by client and 
+
+Alternative 2
+
+7. Obtain ASP from ASP intermmediate by client and standard sku description.
+Composite Key
+Source Table = Socofar Step 6
+Lookup Table = ASP
+Result table = Socofar Step 7
+
+Source Table          		Lookup Table
+----------------------  	-------------------
+[Dem-Cliente]			-> [Customer]
+[STANDARD DESCRIPTION]		-> [STANDARD DESCRIPTION]
+
+Returned columns		Name Column Objective
+[ASP]				[ASP]
+
+
+
+
+
+9. Based on standard name obtain ASP value from ASP examples.
+Source Table = Socofar Step 6
+Lookup Table = ASP intermmediate
+Result table = Socofar Step 7
+
+Source Table          	Lookup Table
+----------------------  -------------------
+[STANDARD DESCRIPTION]	
